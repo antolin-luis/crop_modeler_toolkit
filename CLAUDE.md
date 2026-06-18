@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Purpose
 
-Reproducible, Docker-deployed pipeline that ingests ERA5 (0.25°) daily climate data into a PostgreSQL/PostGIS silver layer, orchestrated by Apache Airflow. Target hardware: Raspberry Pi 5 + 2 TB SSD. Outputs feed DSSAT crop simulations and agricultural insurance pricing.
+Reproducible, Docker-deployed pipeline that ingests ERA5 (0.25°) daily climate data into a PostgreSQL/PostGIS silver layer, orchestrated by Apache Airflow. Target hardware: Raspberry Pi 5 + 2 TB SSD. Outputs feed DSSAT crop simulations for crop modelers, researchers, and students.
 
 The full specification is in `PLANNING.md` — it is the authoritative source for data contracts, formulas, and design decisions.
 

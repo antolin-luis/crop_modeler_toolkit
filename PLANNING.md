@@ -1,9 +1,9 @@
 # ERA5 Daily Climate Database — Implementation Plan
 
 > A reproducible, Docker-deployed pipeline that builds a local daily climate
-> database from ERA5 (0.25°) for agricultural insurance pricing and crop
-> modeling (DSSAT). Build once, then update daily. Works for any region of the
-> planet with a single, consistent grid-encoding scheme.
+> database from ERA5 (0.25°) for crop modeling (DSSAT) by crop modelers,
+> researchers, and students. Build once, then update daily. Works for any region
+> of the planet with a single, consistent grid-encoding scheme.
 
 ---
 
@@ -12,7 +12,7 @@
 Build an open-source, container-based system that lets a user (e.g. a student or
 researcher) download, refine, and serve daily ERA5 climate variables for a
 chosen area of interest, with outputs directly usable for DSSAT crop simulations
-and downstream insurance-pricing work.
+and downstream crop-modeling work.
 
 **In scope (this build):**
 - Bronze ingestion of ERA5 daily variables from the Copernicus CDS.

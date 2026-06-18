@@ -2,7 +2,7 @@
 
 Reproducible, Docker-deployed pipeline that ingests ERA5 (0.25°) daily climate data
 into a PostgreSQL/PostGIS silver layer, orchestrated by Apache Airflow. Outputs feed
-DSSAT crop simulations and agricultural insurance pricing. Target hardware:
+DSSAT crop simulations for crop modelers, researchers, and students. Target hardware:
 Raspberry Pi 5 + 2 TB SSD.
 
 Architecture (medallion: bronze parquet → silver PostGIS → gold `.WTH`) and all data
