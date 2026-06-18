@@ -1,0 +1,30 @@
+# Secrets / local config — never commit credentials, keys, or passwords
+.env
+.env.*
+!.env.example
+.cdsapirc
+*.key
+*.pem
+*.p12
+*.pfx
+*credentials*
+*secret*
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+
+# Data layers (bronze parquet, static .nc) — large/generated, never commit
+/data/
+.localdata/
+*.parquet
+*.nc
+*.grib
+*.dump
+
+# Committed exception: the shipped grid seed IS tracked on purpose (the
+# distribution artifact). seeds/ is not ignored; keep it as the sole large blob.

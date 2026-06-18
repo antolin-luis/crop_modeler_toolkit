@@ -1,0 +1,41 @@
+[project]
+name = "crop-modeler-toolkit"
+version = "0.1.0"
+description = "Reproducible ERA5 0.25° daily climate database for DSSAT crop modeling and agricultural insurance pricing"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "numpy",
+    "pandas",
+    "pyarrow",
+    "xarray",
+    "netCDF4",
+    "cfgrib",
+    "cdsapi",
+    "psycopg2-binary",
+    "python-dotenv",
+]
+
+# apache-airflow is intentionally NOT a project dependency: it is heavy and pins a
+# large dependency tree. It is installed in the airflow image (airflow/Dockerfile)
+# via the official constraints file.
+
+[dependency-groups]
+dev = [
+    "pytest",
+    "ruff",
+]
+
+[tool.setuptools.packages.find]
+include = ["src*"]
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.ruff]
+target-version = "py312"
+line-length = 88
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

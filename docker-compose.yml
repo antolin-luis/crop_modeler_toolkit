@@ -1,0 +1,79 @@
+# ERA5 climate DB stack (PLANNING.md §3, §10, §13).
+# Step 1 skeleton: PostGIS silver layer + Airflow (stub DAGs). Real DAG logic
+# arrives in later roadmap steps.
+
+x-airflow-common: &airflow-common
+  build:
+    context: .
+    dockerfile: airflow/Dockerfile
+  environment: &airflow-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    PYTHONPATH: /opt/airflow
+    # CDS credential passed through to the container (§13).
+    CDSAPI_URL: ${CDS_URL}
+    CDSAPI_KEY: ${CDS_KEY}
+  volumes:
+    - ./airflow/dags:/opt/airflow/dags
+    - ./src:/opt/airflow/src
+    - airflow_logs:/opt/airflow/logs
+  depends_on:
+    postgres:
+      condition: service_healthy
+
+services:
+  postgres:
+    # Multi-arch mirror of the official postgis image — the canonical
+    # postgis/postgis:16-3.4 has no arm64 build, so it fails on the Pi 5 target.
+    image: imresamu/postgis:16-3.4
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    ports:
+      - "${POSTGRES_PORT}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      # Auto-restores the grid seed on a FRESH volume only (initdb runs once).
+      - ./seeds:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  airflow-init:
+    <<: *airflow-common
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        airflow db migrate
+        airflow users create \
+          --username admin --password admin \
+          --firstname admin --lastname admin \
+          --role Admin --email admin@example.com || true
+    restart: on-failure
+
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+    restart: unless-stopped
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-webserver:
+    <<: *airflow-common
+    command: webserver
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+
+volumes:
+  postgres_data:
+  airflow_logs:
