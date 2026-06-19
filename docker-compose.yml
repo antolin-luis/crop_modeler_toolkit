@@ -6,18 +6,24 @@ x-airflow-common: &airflow-common
   build:
     context: .
     dockerfile: airflow/Dockerfile
+  # .env is the single source of config (§13); src/config.py reads CDS_KEY /
+  # CDS_URL / POSTGRES_* by those names, so the whole file is passed through.
+  env_file: .env
   environment: &airflow-env
     AIRFLOW__CORE__EXECUTOR: LocalExecutor
     AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
     AIRFLOW__CORE__LOAD_EXAMPLES: "false"
     PYTHONPATH: /opt/airflow
-    # CDS credential passed through to the container (§13).
+    # cdsapi also honours its own env-var names; keep them in sync (§13).
     CDSAPI_URL: ${CDS_URL}
     CDSAPI_KEY: ${CDS_KEY}
   volumes:
     - ./airflow/dags:/opt/airflow/dags
     - ./src:/opt/airflow/src
     - airflow_logs:/opt/airflow/logs
+    # Bronze Parquet lands here (DATA_DIR=/data → /data/bronze). On the Pi this is
+    # the 2 TB SSD; locally it is the git-ignored ./.localdata dir.
+    - ./.localdata:/data
   depends_on:
     postgres:
       condition: service_healthy
@@ -54,6 +60,8 @@ services:
           --username admin --password admin \
           --firstname admin --lastname admin \
           --role Admin --email admin@example.com || true
+        # Cap simultaneous CDS requests (download_bronze binds to this pool, §10).
+        airflow pools set cds_pool 2 "CDS request cap"
     restart: on-failure
 
   airflow-scheduler:
