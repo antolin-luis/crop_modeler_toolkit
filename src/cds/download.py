@@ -129,9 +129,17 @@ def _chunk_bounds(year: int, months: list[str]) -> tuple[str, str]:
     return f"{year}-{first:02d}-01", f"{year}-{last:02d}-{monthrange(year, last)[1]:02d}"
 
 
+# Default to one month per request: the derived daily-statistics dataset computes
+# each day on-the-fly, and requests larger than (≤2 variables, 1 month) are throttled
+# to ~40 internal workers and share a deep queue. Month-sized requests stay in the
+# fast lane, so 12 small requests beat one big throttled year (ECMWF "small over
+# large", §11.1). The splitter still shrinks a month further only if cost-rejected.
+DEFAULT_MONTHS_PER_CHUNK = 1
+
+
 def _chunk_plan(year: int, ek: str) -> list[list[str]]:
-    """Month groups for the year at the cached granularity (whole year if unprobed)."""
-    size = splitter.get_cached_granularity(ek) or 12
+    """Month groups for the year at the cached granularity (monthly by default)."""
+    size = splitter.get_cached_granularity(ek) or DEFAULT_MONTHS_PER_CHUNK
     return [_ALL_MONTHS[i : i + size] for i in range(0, 12, size)]
 
 
