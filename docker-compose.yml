@@ -33,6 +33,7 @@ services:
     # Multi-arch mirror of the official postgis image — the canonical
     # postgis/postgis:16-3.4 has no arm64 build, so it fails on the Pi 5 target.
     image: imresamu/postgis:16-3.4
+    restart: unless-stopped
     environment:
       POSTGRES_DB: ${POSTGRES_DB}
       POSTGRES_USER: ${POSTGRES_USER}
