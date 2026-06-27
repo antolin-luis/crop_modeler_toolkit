@@ -14,6 +14,10 @@ dependencies = [
     "cdsapi",
     "psycopg2-binary",
     "python-dotenv",
+    "earthengine-api>=1.7.32",
+    "google-cloud-storage>=3.12.0",
+    "rioxarray>=0.22.0",
+    "rasterio>=1.5.0",
 ]
 
 # apache-airflow is intentionally NOT a project dependency: it is heavy and pins a

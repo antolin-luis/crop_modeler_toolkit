@@ -9,6 +9,10 @@
 *.pfx
 *credentials*
 *secret*
+# GEE service-account JSON keys — never commit
+*service-account*.json
+*-gee-key*.json
+*.gee.json
 
 # Python
 __pycache__/

@@ -44,6 +44,17 @@ Before staging, committing, or pushing, run these checks — they are mandatory,
 3. **Scan the staged set first.** Run `git status` and `git diff --cached --stat` and confirm no secret and no unexpected file >~10 MB is staged before committing. If something large or sensitive slipped through, fix `.gitignore` and unstage it.
 4. **Branch, don't push to `main` directly.** Work on a feature branch (e.g. `step3-bronze-download`) and open a PR; only commit/push when the user asks.
 
+### Plan-driven coding workflow (mandatory)
+
+Any code creation or modification that comes out of a `/plan` session **must** follow this sequence:
+
+1. **Branch first.** Before writing or editing any code, create a fresh feature branch off `main`. Do this as the very first action of the coding phase — never start editing on `main`.
+2. **Code on the branch.** All file changes for the plan land on that branch only.
+3. **Hand off for testing.** When the code is complete, stop and let the **user test it**. Do not commit yet.
+4. **Wait for explicit authorization.** Only after the user tests and explicitly authorizes do you: commit, open a PR to merge the branch into `main`, and delete the feature branch once merged.
+
+Steps 3–4 gate on the user — never self-authorize the commit/PR/merge/delete.
+
 ## Architecture
 
 Medallion architecture with three layers:
