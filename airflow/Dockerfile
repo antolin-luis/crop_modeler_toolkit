@@ -11,10 +11,13 @@ ARG PYTHON_VERSION
 USER airflow
 
 # Project runtime dependencies, pinned against the Airflow constraints so the
-# resolver cannot drift Airflow's own dependency tree.
+# resolver cannot drift Airflow's own dependency tree. The second line is the GEE
+# bronze backend (earthengine-api + GCS export + GeoTIFF read); rasterio/rioxarray
+# ship manylinux/aarch64 wheels with GDAL bundled, so no apt libs are needed.
 RUN pip install --no-cache-dir \
     --constraint "https://raw.githubusercontent.com/apache/airflow/constraints-${AIRFLOW_VERSION}/constraints-${PYTHON_VERSION}.txt" \
-    numpy pandas pyarrow xarray netCDF4 cfgrib cdsapi psycopg2-binary python-dotenv
+    numpy pandas pyarrow xarray netCDF4 cfgrib cdsapi psycopg2-binary python-dotenv \
+    earthengine-api google-cloud-storage rioxarray rasterio
 
 # src/ and dags/ are bind-mounted at runtime (see docker-compose.yml); PYTHONPATH
 # makes `import src...` resolve inside the container.
