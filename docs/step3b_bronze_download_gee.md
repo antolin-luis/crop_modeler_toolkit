@@ -74,10 +74,15 @@ For a `timezone` offset of `o` hours (Brazil/Uruguay = `UTC-03:00` → `o = −3
   `GEE_SERVICE_ACCOUNT_FILE` set, else stored user OAuth).
 - `src/gee/export.py` — flatten the collection to a date-named multi-band image, export to
   GCS aligned to the canonical grid (`crsTransform`, the GEE analogue of "never regrid"),
-  poll the task to completion with backoff, download the shard(s), read them into
-  `(values, lat, lon, times)`.
-- `src/gee/download.py` — `download_variable_year(...)`: build → export+fetch → encode with
-  the **shared** `encode_grid` → write `bronze/<var>/<var>_<year>.parquet` → mark manifest.
+  poll the task to completion with backoff, download the shard(s). Two read paths:
+  `iter_geotiff_chunks` (streams band-windows — the production path) and `read_daily_geotiffs`
+  (whole-load — small rasters/tests). `start_export(land_only=True)` clips the export region
+  to land (LSIB) so EE skips interior-ocean tiles.
+- `src/gee/download.py` — `download_variable_year(...)`: build → export+fetch → **stream**
+  the GeoTIFF in `chunk_days` windows through the shared `encode_grid` → `dropna` (masked
+  ocean) → append to a `ParquetWriter` (`.tmp` then atomic `os.replace`) → mark manifest. A
+  full LatAm year never lives in RAM (the Pi-OOM fix). Bronze row order is unspecified (the
+  streamed write can't globally sort; silver upserts on the PK regardless).
 - `airflow/dags/download_bronze_gee.py` — DAG mirroring `download_bronze`; tasks bound to
   the `gee_pool`.
 
@@ -101,7 +106,8 @@ For a `timezone` offset of `o` hours (Brazil/Uruguay = `UTC-03:00` → `o = −3
 1. Complete `docs/gee_setup.md` (project, auth, GCS bucket, `.env`).
 2. Create the pool once: `airflow pools set gee_pool 2 "GEE export cap"`.
 3. Trigger `download_bronze_gee` with `extent` `[S, W, N, E]`, `start_year`/`end_year`,
-   `variables`, `timezone` (e.g. `UTC-03:00`). Same params as the CDS DAG.
+   `variables`, `timezone` (e.g. `UTC-03:00`), plus `land_only` (default True — clip to land,
+   drop ocean) and `chunk_days` (default 30 — lower it if memory is tight on the Pi).
 4. Stay under the monthly EECU quota by **splitting the year range across runs** (there is
    no per-request cost ceiling to probe, so no adaptive splitter — the year range is the
    one lever). See `docs/gee_setup.md` §7.

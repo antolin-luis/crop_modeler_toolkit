@@ -25,15 +25,31 @@ def _plan(**context) -> list[dict]:
     params = context["params"]
     extent = [float(v) for v in params["extent"]]
     timezone = params["timezone"]
+    chunk_days = int(params["chunk_days"])
+    land_only = bool(params["land_only"])
     years = range(int(params["start_year"]), int(params["end_year"]) + 1)
     return [
-        {"variable": variable, "year": year, "extent": extent, "timezone": timezone}
+        {
+            "variable": variable,
+            "year": year,
+            "extent": extent,
+            "timezone": timezone,
+            "chunk_days": chunk_days,
+            "land_only": land_only,
+        }
         for year in years
         for variable in params["variables"]
     ]
 
 
-def _download(variable: str, year: int, extent: list, timezone: str) -> str:
+def _download(
+    variable: str,
+    year: int,
+    extent: list,
+    timezone: str,
+    chunk_days: int,
+    land_only: bool,
+) -> str:
     from src.config import load_config
     from src.gee.client import GEEClient
     from src.gee.download import download_variable_year
@@ -51,6 +67,8 @@ def _download(variable: str, year: int, extent: list, timezone: str) -> str:
         timezone,
         manifest=manifest,
         bronze_dir=bronze_dir,
+        chunk_days=int(chunk_days),
+        land_only=bool(land_only),
     )
     return str(path)
 
@@ -67,6 +85,8 @@ with DAG(
         "end_year": 1995,
         "variables": ["tmax", "tmin", "precip", "srad", "wind_u", "wind_v", "tdew"],
         "timezone": "UTC-03:00",
+        "chunk_days": 30,   # daily bands held in RAM per encode step (Pi memory lever)
+        "land_only": True,  # clip export to land (LSIB); drop masked-ocean cells
     },
 ) as dag:
     plan = PythonOperator(

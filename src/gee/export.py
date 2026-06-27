@@ -47,6 +47,20 @@ def _region(extent: list[float]) -> "ee.Geometry":
     return ee.Geometry.Rectangle([w, s, e, n], proj=_CRS, geodesic=False)
 
 
+# Country polygons used to clip the export to land. ERA5 (unlike ERA5-Land) carries real
+# values over ocean too, so without this the export region is the full rectangle and EE
+# computes every interior-ocean tile — wasted EECU, storage, and egress. Clipping to land
+# roughly halves EECU and (with NaN-drop on read) keeps bronze land-only. Verified live.
+_LAND_FC = "USDOS/LSIB_SIMPLE/2017"
+
+
+def _land_region(extent: list[float], *, max_error: float = 1000.0) -> "ee.Geometry":
+    """Land geometry within ``extent`` = the bbox intersected with LSIB country polygons."""
+    bbox = _region(extent)
+    land = ee.FeatureCollection(_LAND_FC).filterBounds(bbox).geometry()
+    return land.intersection(bbox, maxError=max_error)
+
+
 def start_export(
     daily_col: "ee.ImageCollection",
     extent: list[float],
@@ -54,15 +68,22 @@ def start_export(
     bucket: str,
     name_prefix: str,
     description: str,
+    land_only: bool = True,
 ) -> "ee.batch.Task":
-    """Submit the GCS export task for one ``(variable, year)`` and return the started task."""
+    """Submit the GCS export task for one ``(variable, year)`` and return the started task.
+
+    ``land_only`` (default) clips the export region to land via LSIB; ocean cells then come
+    back masked (nodata) and are dropped on read. Set false to export the full rectangle
+    (incl. ocean, matching the CDS bronze coverage).
+    """
     image = _to_multiband(daily_col)
+    region = _land_region(extent) if land_only else _region(extent)
     task = ee.batch.Export.image.toCloudStorage(
         image=image,
         description=description,
         bucket=bucket,
         fileNamePrefix=name_prefix,
-        region=_region(extent),
+        region=region,
         crs=_CRS,
         crsTransform=_CRS_TRANSFORM,
         fileFormat="GeoTIFF",
@@ -128,14 +149,59 @@ def download_prefix(bucket: str, name_prefix: str, dest_dir: str | Path) -> list
     return sorted(paths)
 
 
+def _band_dates(descriptions) -> list[str]:
+    """Pull the ``YYYY-MM-DD`` each band was named with from its GeoTIFF description."""
+    import re
+
+    if isinstance(descriptions, str):
+        descriptions = (descriptions,)
+    date_re = re.compile(r"\d{4}-\d{2}-\d{2}")
+    out = []
+    for desc in descriptions:
+        m = date_re.search(str(desc))
+        if not m:
+            raise ValueError(f"band description {desc!r} carries no date")
+        out.append(m.group(0))
+    return out
+
+
+def iter_geotiff_chunks(paths: list[Path], *, chunk_days: int = 30):
+    """Stream exported GeoTIFF shard(s) in band-windows → ``(values, lat, lon, times)``.
+
+    Yields one ``(values(k,h,w), lat, lon, times[k])`` tuple per ``chunk_days``-band window
+    per shard, so a full year is never held in RAM at once (the fix for the Pi OOM). Nodata
+    (masked ocean from a land-only export) is read as ``NaN``; ``encode_grid`` + the caller's
+    ``dropna`` discard those cells. Each shard is a full-time spatial sub-block, so windows
+    never span shards.
+    """
+    import numpy as np
+    import pandas as pd
+    import rasterio
+
+    for p in paths:
+        with rasterio.open(p) as src:
+            dates = _band_dates(src.descriptions)
+            t = src.transform
+            cols = np.arange(src.width)
+            rows = np.arange(src.height)
+            lon = t.c + (cols + 0.5) * t.a  # pixel-center longitudes
+            lat = t.f + (rows + 0.5) * t.e  # pixel-center latitudes (t.e is negative)
+            nbands = src.count
+            for i0 in range(0, nbands, chunk_days):
+                idx = list(range(i0, min(i0 + chunk_days, nbands)))
+                bands = [b + 1 for b in idx]  # rasterio bands are 1-based
+                arr = src.read(bands, masked=True).filled(np.nan).astype(np.float64)
+                times = pd.to_datetime([dates[b] for b in idx])
+                yield arr, lat, lon, times
+
+
 def read_daily_geotiffs(paths: list[Path]):
     """Read exported GeoTIFF shard(s) into ``(values, lat, lon, times)`` for ``encode_grid``.
 
     Band descriptions carry the date each band was named with; the band axis becomes the
-    time axis. Multiple spatial shards are mosaicked back together first.
+    time axis. Multiple spatial shards are mosaicked back together first. Whole-load — kept
+    for small rasters and tests; the production path streams via ``iter_geotiff_chunks``.
     """
-    import re
-
     import numpy as np
     import pandas as pd
     import rioxarray  # noqa: F401 — registers the .rio accessor / open_rasterio
@@ -150,17 +216,7 @@ def read_daily_geotiffs(paths: list[Path]):
         da = merge_arrays(arrays)
 
     # Band descriptions = the date-named bands (e.g. "0_2020-01-01"); pull the YYYY-MM-DD.
-    descriptions = da.attrs.get("long_name")
-    if isinstance(descriptions, str):
-        descriptions = (descriptions,)
-    date_re = re.compile(r"\d{4}-\d{2}-\d{2}")
-    times = []
-    for desc in descriptions:
-        m = date_re.search(str(desc))
-        if not m:
-            raise ValueError(f"band description {desc!r} carries no date")
-        times.append(m.group(0))
-    times = pd.to_datetime(times)
+    times = pd.to_datetime(_band_dates(da.attrs.get("long_name")))
 
     values = np.asarray(da.values, dtype=np.float64)  # (band/time, y/lat, x/lon)
     lat = np.asarray(da.y.values)
