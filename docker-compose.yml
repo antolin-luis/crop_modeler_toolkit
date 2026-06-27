@@ -17,6 +17,11 @@ x-airflow-common: &airflow-common
     # cdsapi also honours its own env-var names; keep them in sync (§13).
     CDSAPI_URL: ${CDS_URL}
     CDSAPI_KEY: ${CDS_KEY}
+    # GEE backend: the service-account key is bind-mounted (see volumes); point the
+    # in-container paths at the mount, overriding the host paths .env carries for
+    # host-side runs (an `environment:` value wins over `env_file`).
+    GEE_SERVICE_ACCOUNT_FILE: /opt/airflow/secrets/gee-key.json
+    GOOGLE_APPLICATION_CREDENTIALS: /opt/airflow/secrets/gee-key.json
   volumes:
     - ./airflow/dags:/opt/airflow/dags
     - ./src:/opt/airflow/src
@@ -24,6 +29,9 @@ x-airflow-common: &airflow-common
     # Bronze Parquet lands here (DATA_DIR=/data → /data/bronze). On the Pi this is
     # the 2 TB SSD; locally it is the git-ignored ./.localdata dir.
     - ./.localdata:/data
+    # GEE service-account key, read-only. Source is the host path from .env
+    # (GEE_SERVICE_ACCOUNT_FILE); falls back to /dev/null for CDS-only users.
+    - ${GEE_SERVICE_ACCOUNT_FILE:-/dev/null}:/opt/airflow/secrets/gee-key.json:ro
   depends_on:
     postgres:
       condition: service_healthy
@@ -63,6 +71,8 @@ services:
           --role Admin --email admin@example.com || true
         # Cap simultaneous CDS requests (download_bronze binds to this pool, §10).
         airflow pools set cds_pool 2 "CDS request cap"
+        # Cap simultaneous GEE export tasks (download_bronze_gee binds to this pool).
+        airflow pools set gee_pool 2 "GEE export cap"
     restart: on-failure
 
   airflow-scheduler:

@@ -45,6 +45,22 @@ class CDSConfig:
 
 
 @dataclass(frozen=True)
+class GEEConfig:
+    """Google Earth Engine bronze backend (alternative to CDS; see docs/gee_setup.md).
+
+    All fields are optional at load time so CDS-only users need no GEE setup — the GEE
+    client (``src/gee/client.py``) validates what it actually needs at use time.
+    ``service_account_file`` is the path to the SA JSON key for headless/Airflow auth; if
+    unset, the client falls back to stored user OAuth creds (local dev).
+    """
+
+    project: str | None
+    service_account_file: str | None
+    gcs_bucket: str | None
+    gcs_prefix: str
+
+
+@dataclass(frozen=True)
 class PathsConfig:
     """On-disk layout (PLANNING.md §7). ``DATA_DIR`` defaults to ``/data`` (the SSD
     mount on the Pi target); override via env for local runs outside the container.
@@ -66,6 +82,7 @@ class PathsConfig:
 class Config:
     postgres: PostgresConfig
     cds: CDSConfig
+    gee: GEEConfig
     paths: PathsConfig
 
 
@@ -82,6 +99,12 @@ def load_config() -> Config:
         cds=CDSConfig(
             url=os.getenv("CDS_URL", "https://cds.climate.copernicus.eu/api"),
             key=_require("CDS_KEY"),
+        ),
+        gee=GEEConfig(
+            project=os.getenv("GEE_PROJECT") or None,
+            service_account_file=os.getenv("GEE_SERVICE_ACCOUNT_FILE") or None,
+            gcs_bucket=os.getenv("GEE_GCS_BUCKET") or None,
+            gcs_prefix=os.getenv("GEE_GCS_PREFIX", "bronze-gee"),
         ),
         paths=PathsConfig(
             data_dir=Path(os.getenv("DATA_DIR", "/data")),

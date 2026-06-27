@@ -25,11 +25,9 @@ import xarray as xr
 from src.cds import splitter
 from src.cds.manifest import Manifest
 from src.cds.variables import DATASET, variable_spec
-from src.grid.encoding import cell_codes, parent_codes
-from src.grid.spec import LAT_ORIGIN, NLAT, NLON, RESOLUTION
+from src.grid.encode_long import DEFAULT_BLOCK_SIZE_B, encode_grid
+from src.grid.spec import RESOLUTION
 from src.grid.static_inputs import _normalize_netcdf
-
-DEFAULT_BLOCK_SIZE_B = 4  # must match the grid seed's b (immutable, §6.3)
 
 _ALL_MONTHS = [f"{m:02d}" for m in range(1, 13)]
 _ALL_DAYS = [f"{d:02d}" for d in range(1, 32)]
@@ -83,8 +81,9 @@ def _coord(da: xr.DataArray, names: tuple[str, ...]) -> tuple[str, np.ndarray]:
 def encode_netcdf(path: str | Path, *, b: int = DEFAULT_BLOCK_SIZE_B) -> pd.DataFrame:
     """Encode one daily netCDF chunk to a long frame ``[child_id, parent_id, date, value]``.
 
-    Asserts the product is genuinely **daily** — exactly one value per cell per day —
-    before returning; misconfigured requests have returned hourly data (§5.2).
+    Reads the netCDF onto ``(ntime, nlat, nlon)`` then delegates the grid encoding to the
+    shared :func:`src.grid.encode_long.encode_grid` (the same step the GEE backend runs),
+    which also asserts the product is genuinely daily (§5.2).
     """
     ds = xr.open_dataset(path)
     try:
@@ -98,30 +97,7 @@ def encode_netcdf(path: str | Path, *, b: int = DEFAULT_BLOCK_SIZE_B) -> pd.Data
     finally:
         ds.close()
 
-    lat_i = np.rint((LAT_ORIGIN - lat) / RESOLUTION).astype(np.int64)
-    lon_i = np.rint((lon % 360.0) / RESOLUTION).astype(np.int64)
-    np.clip(lat_i, 0, NLAT - 1, out=lat_i)
-    np.clip(lon_i, 0, NLON - 1, out=lon_i)
-
-    lat_grid, lon_grid = np.meshgrid(lat_i, lon_i, indexing="ij")  # (nlat, nlon)
-    child = cell_codes(lat_grid, lon_grid).ravel()
-    parent = parent_codes(lat_grid, lon_grid, b).ravel()
-    dates = pd.to_datetime(times).normalize().date  # one date per timestep
-    ncell = child.size
-
-    frame = pd.DataFrame(
-        {
-            "child_id": np.tile(child, len(dates)),
-            "parent_id": np.tile(parent, len(dates)),
-            "date": np.repeat(dates, ncell),
-            "value": values.reshape(len(dates), ncell).ravel(),
-        }
-    )
-    if frame.duplicated(["child_id", "date"]).any():
-        raise ValueError(
-            f"{path}: multiple values per cell per day — not daily (hourly?) (§5.2)"
-        )
-    return frame
+    return encode_grid(values, lat, lon, times, source=str(path), b=b)
 
 
 def _chunk_bounds(year: int, months: list[str]) -> tuple[str, str]:
