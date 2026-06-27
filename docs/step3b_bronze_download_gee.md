@@ -20,7 +20,7 @@ over a shifted window, entirely server-side — only the finished daily raster i
 
 ## Decisions
 
-- **Dataset: `ECMWF/ERA5_HOURLY` (0.25°)** — the same grid as `src/grid/spec.py`
+- **Dataset: `ECMWF/ERA5/HOURLY` (0.25°)** — the same grid as `src/grid/spec.py`
   (NLON=1440, NLAT=721, origin 0/90). `child_id`/`parent_id` therefore match the CDS bronze
   exactly. *Not* `ECMWF/ERA5_LAND/HOURLY` (0.1°), which would break the immutable grid spec.
 - **Transport: `Export.image.toCloudStorage` → GCS → download GeoTIFF.** Headless- and
@@ -30,25 +30,27 @@ over a shifted window, entirely server-side — only the finished daily raster i
 
 ## Variable contract (download side, §5.1)
 
-All from `ECMWF/ERA5_HOURLY`; bronze stores the **source** value (conversion is Step 4).
+All from `ECMWF/ERA5/HOURLY`; bronze stores the **source** value (conversion is Step 4).
 
-| silver name | GEE band                                       | reducer |
-|-------------|------------------------------------------------|---------|
-| `tmax`      | `temperature_2m`                               | max     |
-| `tmin`      | `temperature_2m`                               | min     |
-| `precip`    | `total_precipitation_hourly`                   | sum     |
-| `srad`      | `surface_solar_radiation_downwards_hourly`     | sum     |
-| `wind_u`    | `u_component_of_wind_10m`                       | mean    |
-| `wind_v`    | `v_component_of_wind_10m`                       | mean    |
-| `tdew`      | `dewpoint_temperature_2m`                       | mean    |
+| silver name | GEE band                              | reducer |
+|-------------|---------------------------------------|---------|
+| `tmax`      | `temperature_2m`                      | max     |
+| `tmin`      | `temperature_2m`                      | min     |
+| `precip`    | `total_precipitation`                 | sum     |
+| `srad`      | `surface_solar_radiation_downwards`   | sum     |
+| `wind_u`    | `u_component_of_wind_10m`             | mean    |
+| `wind_v`    | `v_component_of_wind_10m`             | mean    |
+| `tdew`      | `dewpoint_temperature_2m`             | mean    |
 
 Two correctness wins over the CDS contract:
 
 - **tmax/tmin** are the max/min of hourly `temperature_2m`, computed by us — this sidesteps
   the biased `maximum_2m_temperature_since_previous_post_processing` parameter (§5.2).
-- **precip/srad** use the **per-hour increment** bands and are **summed**. ERA5
-  accumulations reset at 00 UTC; summing the running-accumulation band across a reset would
-  be wrong. The `*_hourly` increment bands sum cleanly over the local-day window.
+- **precip/srad** are **summed** over the local-day window. In `ECMWF/ERA5/HOURLY` the
+  `total_precipitation` / `surface_solar_radiation_downwards` bands are **per-hour
+  increments** (1-hour accumulations) — verified live by sampling consecutive hours — *not*
+  running totals since 00 UTC, so summing them is correct. (Unlike ERA5-Land, whose
+  accumulations reset at 00 UTC.)
 
 > Band names are the one thing to confirm against the live catalog before a real backfill
 > (GEE occasionally renames bands between dataset revisions):
@@ -64,7 +66,7 @@ For a `timezone` offset of `o` hours (Brazil/Uruguay = `UTC-03:00` → `o = −3
 
 ## Files
 
-- `src/gee/variables.py` — silver-name → `(band, reducer)`, `COLLECTION="ECMWF/ERA5_HOURLY"`.
+- `src/gee/variables.py` — silver-name → `(band, reducer)`, `COLLECTION="ECMWF/ERA5/HOURLY"`.
   Silver keys mirror `src/cds/variables.py`.
 - `src/gee/daily.py` — `build_daily_collection(variable, year, *, offset_hours)` builds the
   per-local-day `ee.ImageCollection` (pure server-side graph; no I/O). `parse_offset_hours`.

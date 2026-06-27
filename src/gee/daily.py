@@ -2,7 +2,7 @@
 
 Pure Earth Engine graph building — **no I/O, no ``getInfo``**. Given a silver variable and
 a year, return an ``ee.ImageCollection`` of one image per **local** day, each the variable's
-daily reducer applied to the hourly ``ECMWF/ERA5_HOURLY`` band over that day's window.
+daily reducer applied to the hourly ``ECMWF/ERA5/HOURLY`` band over that day's window.
 
 Local-day, not UTC (§5.3). GEE's own ``DAILY_AGGR`` aggregates on the UTC day, which would
 mix a UTC-day precip total with a local-day temperature extreme. We instead reduce the

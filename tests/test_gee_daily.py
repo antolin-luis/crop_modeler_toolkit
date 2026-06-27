@@ -55,7 +55,7 @@ def test_selects_collection_band_and_reducer(monkeypatch):
 
     daily_mod.build_daily_collection("tmax", 2020, offset_hours=-3.0)
 
-    fake_ee.ImageCollection.assert_any_call("ECMWF/ERA5_HOURLY")
+    fake_ee.ImageCollection.assert_any_call("ECMWF/ERA5/HOURLY")
     fake_ee.ImageCollection.return_value.select.assert_called_once_with("temperature_2m")
     fake_ee.Reducer.max.assert_called_once()
 

@@ -20,7 +20,7 @@ def test_silver_keys_match_cds():
 
 def test_collection_is_quarter_degree_era5():
     # Must be 0.25° ERA5, NOT ERA5-Land (0.1°), to keep child_id codes compatible.
-    assert COLLECTION == "ECMWF/ERA5_HOURLY"
+    assert COLLECTION == "ECMWF/ERA5/HOURLY"
 
 
 def test_every_spec_is_well_formed():
@@ -40,9 +40,9 @@ def test_temperature_extremes_from_hourly_t2m():
 
 def test_accumulated_fields_use_increment_band_and_sum():
     assert variable_spec("precip") == type(variable_spec("precip"))(
-        "total_precipitation_hourly", "sum"
+        "total_precipitation", "sum"
     )
-    assert variable_spec("srad").band == "surface_solar_radiation_downwards_hourly"
+    assert variable_spec("srad").band == "surface_solar_radiation_downwards"
     assert variable_spec("srad").reducer == "sum"
 
 
