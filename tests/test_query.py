@@ -71,11 +71,21 @@ def test_query_is_partition_pruned_and_ordered():
     query.fetch_series(*MONTEVIDEO, conn=conn)
 
     sql, params = conn.log[0]
-    assert "FROM wth_base WHERE parent_id = %s AND child_id = %s" in sql
-    assert sql.endswith("ORDER BY date")
+    assert "FROM wth_base w" in sql
+    assert "w.parent_id = %s AND w.child_id = %s" in sql  # partition key leads
+    assert sql.endswith("ORDER BY w.date")
     assert params == [parent_code(*MONTEVIDEO, B), cell_code(*MONTEVIDEO)]
     assert "era5_land_base_grid" not in sql  # no grid join
     assert "ST_" not in sql                  # no PostGIS
+
+
+def test_query_left_joins_cell_timezone():
+    conn = FakeConn()
+    query.fetch_series(*MONTEVIDEO, conn=conn)
+
+    sql, _ = conn.log[0]
+    assert "LEFT JOIN cell_timezone tz ON tz.child_id = w.child_id" in sql
+    assert "tz.utc_offset_minutes" in sql
 
 
 def test_date_bounds_are_optional_and_parameterized():
@@ -89,14 +99,15 @@ def test_date_bounds_are_optional_and_parameterized():
 
 def test_series_is_date_indexed_with_silver_columns():
     rows = [
-        (date(2020, 1, 1), 30.0, 18.0, 5.0, 22.0, 5.0, 18.0, 55.0, 4.5, False),
-        (date(2020, 1, 2), 31.0, 19.0, 0.0, 24.0, 4.0, 17.0, 48.0, 5.1, False),
+        (date(2020, 1, 1), 30.0, 18.0, 5.0, 22.0, 5.0, 18.0, 55.0, 4.5, False, -180),
+        (date(2020, 1, 2), 31.0, 19.0, 0.0, 24.0, 4.0, 17.0, 48.0, 5.1, False, -180),
     ]
     frame = query.fetch_series(*MONTEVIDEO, conn=FakeConn(rows))
 
     assert frame.index.name == "date"
     assert list(frame.columns) == query.SERIES_COLUMNS[1:]
     assert frame.loc[date(2020, 1, 1), "tmax"] == 30.0
+    assert frame.loc[date(2020, 1, 1), "utc_offset_minutes"] == -180
     assert len(frame) == 2
 
 

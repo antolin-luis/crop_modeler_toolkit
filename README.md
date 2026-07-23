@@ -11,9 +11,13 @@ authoritative spec.
 
 ## Status
 
-Roadmap Step 1 (Foundations) — repo scaffold, deterministic grid encoding + tests,
-Docker Compose skeleton. The four Airflow DAGs are stubs; real download/transform
-logic arrives in later roadmap steps (PLANNING.md §15).
+Roadmap Steps 1–4 complete (PLANNING.md §15): grid seed, bronze download from **either**
+the CDS or Google Earth Engine, and the silver transform. The database is queryable — a
+coordinate returns a daily weather DataFrame with `tmax`, `tmin`, `precip`, `srad`, `wind`,
+`tdew`, plus derived `rh` (Tetens) and `et0` (FAO-56).
+
+Still stubs: `update` (Step 5 — daily append + rolling ERA5T re-fetch), gold `.WTH`
+materialization (Step 6), frontend (Step 7).
 
 ## Quickstart
 
@@ -24,25 +28,34 @@ cp .env.example .env
 # 2. Python deps (uv only — no pip/poetry)
 uv sync
 
-# 3. Run tests (grid round-trip, capacity, known codes, parent grouping)
+# 3. Run tests and lint (all offline — no CDS/GEE calls)
 uv run pytest
-
-# 4. Lint
 uv run ruff check src tests
 
-# 5. Bring up the stack (PostGIS + Airflow at http://localhost:8080, admin/admin)
-docker compose up
+# 4. Bring up the stack (PostGIS + Airflow at http://localhost:8080, admin/admin)
+docker compose up -d
+```
+
+Then follow **[docs/runbook.md](docs/runbook.md)** — the end-to-end operating guide:
+trigger the download and transform DAGs, and verify the result in DBeaver or from Python.
+
+```python
+from src.db.query import fetch_series
+df = fetch_series(-34.9, -56.2, "2020-01-01", "2020-12-31")   # Montevideo, daily
 ```
 
 ## Layout
 
 ```
-src/grid/        canonical grid spec + deterministic encoding (the contract)
-src/cds/         CDS client / splitter / manifest        (later)
-src/transform/   wide merge, Tetens RH, FAO-56 ET0, QA   (later)
-src/db/          DDL, COPY loader, grid seeder           (later)
-airflow/dags/    grid_build, download_bronze, transform_silver, update (stubs)
-tests/           grid contract tests
+src/grid/        canonical grid spec, deterministic encoding, shared raster encoder
+src/cds/         CDS client, adaptive cost splitter, manifest, download
+src/gee/         Earth Engine backend: daily reduce, GCS export, streamed encode
+src/transform/   wide merge, unit contract, Tetens RH, FAO-56 ET0, QA
+src/db/          grid + silver DDL, COPY/upsert loaders, seeder, read API
+airflow/dags/    grid_build, download_bronze[_gee], transform_silver, update
+seeds/           shipped global grid dump, restored at first container init
+docs/            runbook + one design doc per roadmap step
+tests/           129 offline tests
 ```
 
 ## Grid encoding

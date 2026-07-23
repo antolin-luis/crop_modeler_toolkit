@@ -160,3 +160,48 @@ def test_loader_columns_match_the_ddl(column):
     ddl = silver_load.SCHEMA_SQL.read_text()
     assert column in silver_load.COLUMNS
     assert column in ddl
+
+
+@pytest.mark.parametrize("tz,minutes", [
+    ("UTC", 0),
+    ("UTC-03:00", -180),
+    ("UTC-06:00", -360),
+    ("UTC+05:30", 330),   # fractional zone — why minutes, not hours
+    ("UTC+00:00", 0),
+])
+def test_parse_offset_minutes(tz, minutes):
+    assert silver_load.parse_offset_minutes(tz) == minutes
+
+
+def test_parse_offset_minutes_rejects_garbage():
+    with pytest.raises(ValueError, match="bad timezone"):
+        silver_load.parse_offset_minutes("America/Montevideo")
+
+
+def test_upsert_cell_timezone_dedupes_and_conflicts():
+    conn = FakeConn()
+    n = silver_load.upsert_cell_timezone(conn, ["EU9K", "EU9L", "EU9K"], -180)
+
+    assert n == 2  # deduplicated
+    assert any(s.startswith("CREATE TEMP TABLE _tz_staging") for s in conn.statements)
+    assert any(s.startswith("COPY _tz_staging") for s in conn.statements)
+
+    insert = next(s for s in conn.statements if s.startswith("INSERT INTO cell_timezone"))
+    assert "ON CONFLICT (child_id) DO UPDATE SET" in insert
+    assert "utc_offset_minutes = EXCLUDED.utc_offset_minutes" in insert
+    assert "updated_at = now()" in insert
+
+    payload = next(b for sql, b in conn.log if sql.startswith("COPY _tz_staging"))
+    assert payload == "EU9K,-180\nEU9L,-180\n"  # sorted, one row per unique cell
+
+
+def test_upsert_cell_timezone_empty_is_noop():
+    conn = FakeConn()
+    assert silver_load.upsert_cell_timezone(conn, [], -180) == 0
+    assert conn.statements == []
+
+
+def test_cell_timezone_table_in_ddl():
+    ddl = silver_load.SCHEMA_SQL.read_text()
+    assert "CREATE TABLE IF NOT EXISTS cell_timezone" in ddl
+    assert "utc_offset_minutes SMALLINT" in ddl

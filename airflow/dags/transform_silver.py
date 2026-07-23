@@ -23,6 +23,12 @@ from airflow.operators.python import PythonOperator
 
 DEFAULT_VARIABLES = ["tmax", "tmin", "precip", "srad", "wind_u", "wind_v", "tdew"]
 
+# Caps concurrent year tasks. Unlike max_active_tasks below (a DAG attribute, editable
+# only in code), pool slots are editable live in the UI under Admin → Pools — so the
+# operator can throttle a running backfill on a memory-constrained host without a code
+# change. Created by airflow-init alongside cds_pool / gee_pool.
+SILVER_POOL = "silver_pool"
+
 
 def _plan(**context) -> list[dict]:
     """One entry per year in the requested range."""
@@ -34,6 +40,8 @@ def _plan(**context) -> list[dict]:
             "parent_batch_size": int(params["parent_batch_size"]),
             "final_cutoff": params.get("final_cutoff") or None,
             "preliminary_months": int(params["preliminary_months"]),
+            "data_root": params.get("data_root") or None,
+            "timezone": params["timezone"],
         }
         for year in range(int(params["start_year"]), int(params["end_year"]) + 1)
     ]
@@ -45,20 +53,22 @@ def _transform_year(
     parent_batch_size: int,
     final_cutoff: str | None,
     preliminary_months: int,
+    data_root: str | None = None,
+    timezone: str = "UTC-03:00",
 ) -> dict:
     import logging
     from datetime import date
 
     import pendulum as _pendulum
 
-    from src.config import load_config
+    from src.config import resolve_bronze_dir
     from src.db import load as db_load
     from src.db import silver_load
     from src.transform import merge, qa
 
     log = logging.getLogger(__name__)
     year = int(year)
-    bronze_dir = load_config().paths.bronze_dir
+    bronze_dir = resolve_bronze_dir(data_root)
 
     present = merge.available_variables(bronze_dir, year, variables)
     if not present:
@@ -71,7 +81,11 @@ def _transform_year(
         cutoff = silver_load.preliminary_cutoff(
             _pendulum.now("UTC").date(), months=int(preliminary_months)
         )
-    log.info("year %s: variables=%s, ERA5T cutoff=%s", year, present, cutoff)
+    offset_minutes = silver_load.parse_offset_minutes(timezone)
+    log.info(
+        "year %s: variables=%s, ERA5T cutoff=%s, local-day offset=%s min",
+        year, present, cutoff, offset_minutes,
+    )
 
     conn = db_load.connect()
     loaded = quarantined = 0
@@ -89,6 +103,8 @@ def _transform_year(
 
             loaded += silver_load.upsert_wide(conn, good)
             quarantined += silver_load.record_failures(conn, failures, batch, year)
+            # Record the local-day offset for every cell we loaded (§5.3).
+            silver_load.upsert_cell_timezone(conn, good["child_id"], offset_minutes)
 
             report = qa.calendar_report(wide, year)
             short = report.loc[report["missing"] > 0]
@@ -110,6 +126,14 @@ with DAG(
     schedule=None,
     start_date=pendulum.datetime(2026, 1, 1, tz="UTC"),
     catchup=False,
+    # Backstop for SILVER_POOL (which is the tunable knob). Measured on the Pi 5 target:
+    # one year task peaks at ~220 MB RSS — almost all of it the pandas/pyarrow/numpy
+    # import baseline, which is per-process and fixed — plus Airflow's task-runner
+    # overhead. Airflow's default of 16 concurrent tasks is therefore ~5-7 GB, enough to
+    # thrash an 8 GB Pi with a 200 MB swap file into a hard freeze. A year takes ~9 s, so
+    # a 47-year backfill is ~3 min at 3-way concurrency: nothing to win by raising this,
+    # and a machine to lose. In-task memory is governed separately by parent_batch_size.
+    max_active_tasks=3,
     tags=["era5", "silver", "transform"],
     params={
         "start_year": 2020,
@@ -119,11 +143,14 @@ with DAG(
         "parent_batch_size": 8,      # parents per commit — the memory lever
         "preliminary_months": 3,     # ERA5T rolling window (§11.3)
         "final_cutoff": "",          # ISO date; blank = derive from preliminary_months
+        "data_root": "",             # per-run data root override; blank = env DATA_DIR.
+                                     # Must match the root the bronze was downloaded to.
     },
 ) as dag:
     plan = PythonOperator(task_id="plan", python_callable=_plan)
     transform = PythonOperator.partial(
         task_id="transform",
         python_callable=_transform_year,
+        pool=SILVER_POOL,
     ).expand(op_kwargs=plan.output)
     plan >> transform

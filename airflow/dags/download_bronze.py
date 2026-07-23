@@ -23,21 +23,27 @@ def _plan(**context) -> list[dict]:
     params = context["params"]
     extent = [float(v) for v in params["extent"]]
     timezone = params["timezone"]
+    data_root = params.get("data_root") or None
     years = range(int(params["start_year"]), int(params["end_year"]) + 1)
     return [
-        {"variable": variable, "year": year, "extent": extent, "timezone": timezone}
+        {
+            "variable": variable, "year": year, "extent": extent,
+            "timezone": timezone, "data_root": data_root,
+        }
         for year in years
         for variable in params["variables"]
     ]
 
 
-def _download(variable: str, year: int, extent: list, timezone: str) -> str:
+def _download(
+    variable: str, year: int, extent: list, timezone: str, data_root: str | None = None
+) -> str:
     from src.cds.client import CDSClient
     from src.cds.download import download_variable_year
     from src.cds.manifest import Manifest
-    from src.config import load_config
+    from src.config import resolve_bronze_dir
 
-    bronze_dir = load_config().paths.bronze_dir
+    bronze_dir = resolve_bronze_dir(data_root)
     manifest = Manifest.for_bronze_dir(bronze_dir)
     path = download_variable_year(
         CDSClient(),
@@ -63,6 +69,8 @@ with DAG(
         "end_year": 1995,
         "variables": ["tmax", "tmin", "precip", "srad", "wind_u", "wind_v", "tdew"],
         "timezone": "UTC-03:00",
+        "data_root": "",    # per-run data root override; blank = env DATA_DIR. Give each
+                            # region its own root (e.g. /data/hn) to avoid manifest clashes.
     },
 ) as dag:
     plan = PythonOperator(

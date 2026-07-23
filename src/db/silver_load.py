@@ -21,12 +21,18 @@ from __future__ import annotations
 
 import calendar
 import io
+import re
 from datetime import date
 from pathlib import Path
 
 import pandas as pd
 
 from src.db import load as db_load
+
+# Same ``UTC`` / ``UTC±HH:MM`` form the download DAGs take (mirrors src/gee/daily.py's
+# parser). Kept here, not imported from src/gee, so the silver path never pulls in the
+# earthengine dependency.
+_TZ_RE = re.compile(r"^UTC(?:([+-])(\d{2}):(\d{2}))?$")
 
 SCHEMA_SQL = Path(__file__).with_name("silver_schema.sql")
 TABLE = "wth_base"
@@ -105,6 +111,55 @@ def fetch_cell_meta(conn, parent_ids) -> pd.DataFrame:
     # CHAR(4) comes back space-padded from psycopg2; bronze codes are not.
     meta["child_id"] = meta["child_id"].str.strip()
     return meta
+
+
+def parse_offset_minutes(timezone: str) -> int:
+    """Parse a ``UTC`` / ``UTC±HH:MM`` local-day offset to signed minutes (§5.3).
+
+    Minutes, not hours, so fractional zones (``UTC+05:30`` → 330) are exact. ``UTC`` → 0.
+    """
+    m = _TZ_RE.match(timezone.strip())
+    if not m:
+        raise ValueError(f"bad timezone {timezone!r}; expected 'UTC' or 'UTC±HH:MM'")
+    sign, hh, mm = m.groups()
+    if sign is None:
+        return 0
+    magnitude = int(hh) * 60 + int(mm)
+    return magnitude if sign == "+" else -magnitude
+
+
+def upsert_cell_timezone(conn, child_ids, offset_minutes: int) -> int:
+    """Record the local-day offset for ``child_ids`` in ``cell_timezone`` (§5.3).
+
+    Idempotent per cell: ``ON CONFLICT DO UPDATE`` keeps the latest offset, matching
+    ``wth_base``'s own last-write-wins upsert. Called once per loaded batch; the offset is
+    uniform within a region, so the repeated writes are cheap and self-correcting.
+    """
+    codes = sorted({c for c in child_ids})
+    if not codes:
+        return 0
+
+    staging = "_tz_staging"
+    with conn.cursor() as cur:
+        cur.execute(
+            f"CREATE TEMP TABLE {staging} "
+            "(child_id CHAR(4), utc_offset_minutes SMALLINT) ON COMMIT DROP"
+        )
+    buf = io.StringIO()
+    for code in codes:
+        buf.write(f"{code},{offset_minutes}\n")
+    buf.seek(0)
+    db_load.copy_csv(conn, staging, ["child_id", "utc_offset_minutes"], buf)
+
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO cell_timezone (child_id, utc_offset_minutes) "
+            f"SELECT child_id, utc_offset_minutes FROM {staging} "
+            "ON CONFLICT (child_id) DO UPDATE SET "
+            "utc_offset_minutes = EXCLUDED.utc_offset_minutes, updated_at = now()"
+        )
+    conn.commit()
+    return len(codes)
 
 
 def _copy_frame(conn, table: str, columns: list[str], frame: pd.DataFrame) -> None:

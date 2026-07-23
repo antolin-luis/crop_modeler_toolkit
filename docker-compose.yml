@@ -73,6 +73,9 @@ services:
         airflow pools set cds_pool 2 "CDS request cap"
         # Cap simultaneous GEE export tasks (download_bronze_gee binds to this pool).
         airflow pools set gee_pool 2 "GEE export cap"
+        # Cap simultaneous silver year-transforms (transform_silver binds to this pool).
+        # ~220 MB per task process on the Pi target; tune slots live in Admin -> Pools.
+        airflow pools set silver_pool 3 "Silver transform memory cap"
     restart: on-failure
 
   airflow-scheduler:
