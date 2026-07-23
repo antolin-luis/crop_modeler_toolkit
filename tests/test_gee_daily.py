@@ -53,7 +53,7 @@ def test_selects_collection_band_and_reducer(monkeypatch):
     fake_ee, _ = _fake_ee_with_capture()
     monkeypatch.setattr(daily_mod, "ee", fake_ee)
 
-    daily_mod.build_daily_collection("tmax", 2020, offset_hours=-3.0)
+    daily_mod.build_daily_collection("tmax", 2020, zones=[(-3.0, None)])
 
     fake_ee.ImageCollection.assert_any_call("ECMWF/ERA5/HOURLY")
     fake_ee.ImageCollection.return_value.select.assert_called_once_with("temperature_2m")
@@ -68,7 +68,7 @@ def test_reducer_per_variable(monkeypatch, variable, reducer_attr):
     fake_ee, _ = _fake_ee_with_capture()
     monkeypatch.setattr(daily_mod, "ee", fake_ee)
 
-    daily_mod.build_daily_collection(variable, 2021, offset_hours=-3.0)
+    daily_mod.build_daily_collection(variable, 2021, zones=[(-3.0, None)])
 
     getattr(fake_ee.Reducer, reducer_attr).assert_called_once()
 
@@ -78,9 +78,16 @@ def test_day_sequence_length_handles_leap(monkeypatch, year, last_index):
     fake_ee, _ = _fake_ee_with_capture()
     monkeypatch.setattr(daily_mod, "ee", fake_ee)
 
-    daily_mod.build_daily_collection("tmax", year, offset_hours=-3.0)
+    daily_mod.build_daily_collection("tmax", year, zones=[(-3.0, None)])
 
     fake_ee.List.sequence.assert_called_once_with(0, last_index)
+
+
+def test_empty_zones_rejected(monkeypatch):
+    fake_ee, _ = _fake_ee_with_capture()
+    monkeypatch.setattr(daily_mod, "ee", fake_ee)
+    with pytest.raises(ValueError):
+        daily_mod.build_daily_collection("tmax", 2020, zones=[])
 
 
 def test_local_day_window_shift(monkeypatch):
@@ -88,7 +95,7 @@ def test_local_day_window_shift(monkeypatch):
     fake_ee, captured = _fake_ee_with_capture()
     monkeypatch.setattr(daily_mod, "ee", fake_ee)
 
-    daily_mod.build_daily_collection("tmax", 2020, offset_hours=-3.0)
+    daily_mod.build_daily_collection("tmax", 2020, zones=[(-3.0, None)])
     captured["fn"](5)  # run the per-day callback for some day index
 
     # year_start.advance(day,'day') -> local_start; local_start.advance(-offset,'hour').
@@ -97,3 +104,29 @@ def test_local_day_window_shift(monkeypatch):
     # win_start.advance(24,'hour') -> win_end (win_start is local_start.advance.return_value)
     win_start = local_start.advance.return_value
     win_start.advance.assert_any_call(24, "hour")
+
+
+def test_multi_zone_mosaics_per_offset_windows(monkeypatch):
+    # Two timezones in one extent: each zone reduces over its own shifted window, clips to
+    # its region, and the day image is the mosaic of the two. (The correctness of a
+    # multi-country run: a -6 cell must not use the -3 window.)
+    fake_ee, captured = _fake_ee_with_capture()
+    monkeypatch.setattr(daily_mod, "ee", fake_ee)
+    region_a, region_b = MagicMock(name="regionA"), MagicMock(name="regionB")
+
+    daily_mod.build_daily_collection(
+        "precip", 2020, zones=[(-3.0, region_a), (-6.0, region_b)]
+    )
+    captured["fn"](10)
+
+    local_start = fake_ee.Date.fromYMD.return_value.advance.return_value
+    local_start.advance.assert_any_call(3.0, "hour")   # -(-3.0)
+    local_start.advance.assert_any_call(6.0, "hour")   # -(-6.0)
+    # Each zone's reduced image is clipped to its region, then the day is their mosaic.
+    # hourly = ee.ImageCollection(COLLECTION).select(band); reduced = hourly.filterDate(...)
+    #          .reduce(reducer).rename(band).
+    hourly = fake_ee.ImageCollection.return_value.select.return_value
+    reduced = hourly.filterDate.return_value.reduce.return_value.rename.return_value
+    reduced.clip.assert_any_call(region_a)
+    reduced.clip.assert_any_call(region_b)
+    fake_ee.ImageCollection.return_value.mosaic.assert_called()

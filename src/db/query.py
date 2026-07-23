@@ -1,9 +1,10 @@
 """Point read API for silver (PLANNING.md §8.1 lookup pattern).
 
 The whole point of the grid design: a coordinate resolves to its cell **arithmetically**,
-so a single-cell time series needs no PostGIS, no spatial index and no join against
-``era5_land_base_grid`` — just ``child_id``/``parent_id`` computed in Python and one
-partition-pruned ``SELECT``. (``geom`` + GiST is for polygon/region queries, not this.)
+so a single-cell time series needs no PostGIS and no spatial index — just
+``child_id``/``parent_id`` computed in Python and one partition-pruned ``SELECT``. (``geom``
++ GiST is for polygon/region queries, not this.) The one join is a cheap PK lookup on
+``era5_land_base_grid`` for the cell's ``t_zone`` (local-day offset, §5.3).
 
 Consumers get a plain date-indexed DataFrame in silver units; the DSSAT ``.WTH``
 materialization (gold) is a later, separate step and is not needed to use the data.
@@ -55,15 +56,16 @@ def fetch_cell_series(
         clauses.append("w.date <= %s")
         params.append(end)
 
-    # utc_offset_minutes lives on cell_timezone (§5.3); LEFT JOIN so a cell with no
-    # recorded offset still returns its series (offset simply NULL).
+    # utc_offset_minutes is the cell's standard local-day offset, now carried on the grid
+    # itself (era5_land_base_grid.t_zone, §5.3) — the single source of truth. LEFT JOIN so a
+    # cell absent from the grid still returns its series (offset simply NULL).
     select = ", ".join(
-        "tz.utc_offset_minutes" if c == "utc_offset_minutes" else f"w.{c}"
+        "g.t_zone" if c == "utc_offset_minutes" else f"w.{c}"
         for c in SERIES_COLUMNS
     )
     sql = (
         f"SELECT {select} FROM wth_base w "
-        "LEFT JOIN cell_timezone tz ON tz.child_id = w.child_id "
+        "LEFT JOIN era5_land_base_grid g ON g.child_id = w.child_id "
         f"WHERE {' AND '.join(clauses)} ORDER BY w.date"
     )
 

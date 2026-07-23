@@ -9,7 +9,13 @@ import numpy as np
 import pytest
 import xarray as xr
 
-from src.db.seed_grid import GRAVITY, build_rows
+from src.db.seed_grid import (
+    GRAVITY,
+    _longitude_offset_minutes,
+    assign_timezone,
+    build_rows,
+    std_offset_minutes,
+)
 from src.grid.encoding import cell_code, parent_code
 from src.grid.spec import NLAT, NLON
 
@@ -74,3 +80,41 @@ def test_is_land_mostly_false_with_tiny_fixture(geopotential, land_mask):
     df = build_rows(geopotential, land_mask, b=B)
     # Only the single fixture cell can be land; the global grid is overwhelmingly sea.
     assert df["is_land"].sum() <= 1
+
+
+# --- per-cell timezone (t_zone) -----------------------------------------------------
+@pytest.mark.parametrize("tzid, minutes", [
+    ("America/Sao_Paulo", -180),     # Brazil (SE) = UTC-3, no DST since 2019
+    ("America/Tegucigalpa", -360),   # Honduras = UTC-6
+    ("America/Montevideo", -180),    # Uruguay = UTC-3
+    ("Asia/Kolkata", 330),           # India = UTC+5:30 (fractional -> minutes)
+    ("Asia/Kathmandu", 345),         # Nepal = UTC+5:45
+    ("UTC", 0),
+])
+def test_std_offset_minutes(tzid, minutes):
+    assert std_offset_minutes(tzid) == minutes
+
+
+@pytest.mark.parametrize("lon, minutes", [
+    (-45.0, -180), (-60.0, -240), (-75.0, -300), (0.0, 0), (30.0, 120),
+])
+def test_longitude_offset_fallback(lon, minutes):
+    assert _longitude_offset_minutes(lon) == minutes
+
+
+def test_assign_timezone_land_uses_shapefile_ocean_uses_longitude():
+    # Montevideo (land) -> -180 from the tz polygon; open Pacific (not land) -> longitude.
+    lat = [-34.9, 0.0]
+    lon = [-56.2, -140.0]
+    is_land = [True, False]
+    out = assign_timezone(lat, lon, is_land)
+    assert out.dtype == np.int16
+    assert out[0] == -180
+    assert out[1] == _longitude_offset_minutes(-140.0)  # solar fallback, not a tz polygon
+
+
+def test_build_rows_has_t_zone(geopotential, land_mask):
+    df = build_rows(geopotential, land_mask, b=B)
+    assert "t_zone" in df.columns
+    assert df["t_zone"].notna().all()          # NOT NULL in the DDL
+    assert df["t_zone"].between(-720, 840).all()  # valid UTC offset range (minutes)

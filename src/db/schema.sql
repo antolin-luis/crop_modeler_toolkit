@@ -10,6 +10,7 @@ CREATE TABLE IF NOT EXISTS era5_land_base_grid (
     lon        DOUBLE PRECISION NOT NULL,            -- cell center, -180..180
     is_land    BOOLEAN          NOT NULL,
     elevation  REAL,                                 -- meters (z / 9.80665)
+    t_zone     SMALLINT         NOT NULL,            -- standard UTC offset, minutes (no DST)
     geom       GEOMETRY(Polygon, 4326) NOT NULL,     -- 0.25° square cell
     PRIMARY KEY (child_id)
 );

@@ -8,10 +8,12 @@
 ## Context
 
 The silver layer's static foundation is `era5_land_base_grid` — one row per 0.25°
-cell with `child_id`, `parent_id`, `lat`/`lon`, `is_land`, `elevation`, `geom`. It is
-fully deterministic from the canonical spec + two static inputs, so per §8.1 it is
-**shipped as a seed** (users don't rebuild ~1M polygons on a Pi). This step writes
-the build code (`grid_build` DAG) and produces the committed seed.
+cell with `child_id`, `parent_id`, `lat`/`lon`, `is_land`, `elevation`, `t_zone`, `geom`
+(`t_zone` = per-cell standard, non-DST UTC offset in minutes, the local-day definition,
+§5.3; from the political tz shapefile via `timezonefinder`, ocean/unknown-zone cells fall
+back to the longitude solar offset). It is fully deterministic from the canonical spec + two
+static inputs, so per §8.1 it is **shipped as a seed** (users don't rebuild ~1M polygons on
+a Pi). This step writes the build code (`grid_build` DAG) and produces the committed seed.
 
 Decisions confirmed: doc in `docs/`; static inputs via a coded CDS fetch helper with
 manual-drop fallback; **global** grid distributed as a **SQL-dump seed**.
@@ -62,10 +64,21 @@ Both fetched **without** the CDS `grid` parameter (§11.1). Static → download 
     `parent_id` (reuse `src/grid/encoding.py` — vectorize the base-36 step).
   - `elevation` ← geopotential 0.25° field aligned by `(lat_idx, lon_idx)`.
   - `is_land` ← `src/grid/land_mask.compute_is_land`.
+  - `t_zone` ← `assign_timezone` (§5.3): `TimezoneFinderL` (H3-shortcut — the full polygon
+    `TimezoneFinder` is ~100× slower, minutes→hours on the Pi) maps each **land** cell center
+    to an IANA zone, then `std_offset_minutes` to a standard (non-DST) offset; ocean cells and
+    zones missing from the local `tzdata` fall back to the longitude solar offset.
   - Load via `COPY` into a temp/staging set of columns; compute `geom` in SQL with
     `ST_MakeEnvelope(lon-0.125, lat-0.125, lon+0.125, lat+0.125, 4326)` (avoids
     generating ~1M WKT strings in Python).
   - CLI entrypoint so a maintainer runs it once to produce the seed.
+
+> **Rebuilding the seed on an existing DB:** the grid DDL is `CREATE TABLE IF NOT EXISTS`, so
+> it won't add the `t_zone` column to a table that predates it — `DROP TABLE
+> era5_land_base_grid CASCADE` first, then run `seed_grid.py`. The Airflow image also needs
+> `timezonefinder` and a **current `tzdata`** (the Airflow-pinned one lags the tz boundary
+> data, which returns new zones like `America/Coyhaique`) — both are in `airflow/Dockerfile`,
+> so `docker compose build` before rebuilding.
 - `src/db/load.py` — small `COPY`-helper (psycopg2 `copy_expert`) reused here and in
   Step 4. Connection from `src/config.py` DSN.
 

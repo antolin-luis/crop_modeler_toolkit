@@ -41,7 +41,6 @@ def _plan(**context) -> list[dict]:
             "final_cutoff": params.get("final_cutoff") or None,
             "preliminary_months": int(params["preliminary_months"]),
             "data_root": params.get("data_root") or None,
-            "timezone": params["timezone"],
         }
         for year in range(int(params["start_year"]), int(params["end_year"]) + 1)
     ]
@@ -54,7 +53,6 @@ def _transform_year(
     final_cutoff: str | None,
     preliminary_months: int,
     data_root: str | None = None,
-    timezone: str = "UTC-03:00",
 ) -> dict:
     import logging
     from datetime import date
@@ -81,11 +79,9 @@ def _transform_year(
         cutoff = silver_load.preliminary_cutoff(
             _pendulum.now("UTC").date(), months=int(preliminary_months)
         )
-    offset_minutes = silver_load.parse_offset_minutes(timezone)
-    log.info(
-        "year %s: variables=%s, ERA5T cutoff=%s, local-day offset=%s min",
-        year, present, cutoff, offset_minutes,
-    )
+    # No local-day offset here: it is per-cell on the grid (era5_land_base_grid.t_zone),
+    # applied at GEE reduction time — not a transform-side choice (§5.3).
+    log.info("year %s: variables=%s, ERA5T cutoff=%s", year, present, cutoff)
 
     conn = db_load.connect()
     loaded = quarantined = 0
@@ -103,8 +99,6 @@ def _transform_year(
 
             loaded += silver_load.upsert_wide(conn, good)
             quarantined += silver_load.record_failures(conn, failures, batch, year)
-            # Record the local-day offset for every cell we loaded (§5.3).
-            silver_load.upsert_cell_timezone(conn, good["child_id"], offset_minutes)
 
             report = qa.calendar_report(wide, year)
             short = report.loc[report["missing"] > 0]
@@ -139,7 +133,6 @@ with DAG(
         "start_year": 2020,
         "end_year": 2020,
         "variables": DEFAULT_VARIABLES,
-        "timezone": "UTC-03:00",     # local-day metadata; bronze was fetched this way (§5.3)
         "parent_batch_size": 8,      # parents per commit — the memory lever
         "preliminary_months": 3,     # ERA5T rolling window (§11.3)
         "final_cutoff": "",          # ISO date; blank = derive from preliminary_months

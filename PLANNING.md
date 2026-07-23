@@ -158,12 +158,25 @@ hourly data.
 
 ### 5.3 Day definition
 
-Use **local day** (the extent's timezone), recorded as silver metadata. Rationale:
-clean comparison against real field weather stations (which report local day) and
-DSSAT's local-day expectation. The CDS daily-statistics dataset supports a
-timezone shift; only UTC or zones **west of UTC** retrieve a fully sampled first
-day — Brazil (UTC−3) qualifies. Apply the *same* day definition to **all**
-variables to avoid mixing UTC-day precip with local-day temperature.
+Use **local day**. Rationale: clean comparison against real field weather stations
+(which report local day) and DSSAT's local-day expectation. Apply the *same* day
+definition to **all** variables of a cell to avoid mixing UTC-day precip with
+local-day temperature.
+
+The offset is **per cell**, carried on the grid seed as
+`era5_land_base_grid.t_zone` (standard, non-DST UTC offset in **minutes**). It is
+assigned once from the political timezone shapefile (`timezonefinder` at seed time;
+cells outside any polygon fall back to the longitude solar offset). This is the single
+source of truth: `query.fetch_cell_series` joins the grid to surface it, so a cell's
+series is unambiguous with nothing to configure.
+
+- **GEE backend (default):** applies the offset at reduction. For an extent it derives one
+  zone per distinct offset from the tz-polygon EE asset and reduces+clips each, so a
+  multi-timezone extent is correct in one run (no `timezone` param). Reduction is lossy
+  (daily sum/max/min), so the offset *must* be applied here, not converted afterward.
+- **CDS backend:** takes a single `timezone` applied to the whole extent (server-side
+  `time_zone`); correct only for a single-timezone extent — split multi-tz extents by hand.
+  Only UTC or zones **west of UTC** retrieve a fully sampled first day.
 
 ### 5.4 Elevation from geopotential
 
@@ -463,7 +476,7 @@ per-user queue limits and penalizes heavy/parallel use).
 | `start_year`   | download_bronze   |                                                  |
 | `end_year`     | download_bronze   |                                                  |
 | `variables`    | download_bronze   | subset of the variable contract                  |
-| `timezone`     | download/transform| local-day offset (e.g. UTC−3); stored as metadata|
+| `timezone`     | download_bronze (CDS) | single local-day offset (e.g. UTC−3) for the whole extent. **GEE has no timezone param** — per-cell offset from grid `t_zone` (§5.3) |
 
 ---
 

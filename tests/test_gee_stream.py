@@ -110,6 +110,7 @@ def test_download_variable_year_streams_and_drops_ocean(tmp_path, monkeypatch):
     dates = ["2020-01-01", "2020-01-02", "2020-01-03"]
     _write_tiff(tiff, dates, nodata_cell=(2, 2))
 
+    monkeypatch.setattr(dl, "tz_zones", lambda *a, **k: [(-3.0, None)])
     monkeypatch.setattr(dl, "build_daily_collection", lambda *a, **k: object())
     monkeypatch.setattr(dl, "start_export", lambda *a, **k: object())
     monkeypatch.setattr(dl, "wait_for_task", lambda *a, **k: None)
@@ -118,8 +119,9 @@ def test_download_variable_year_streams_and_drops_ocean(tmp_path, monkeypatch):
     bronze = tmp_path / "bronze"
     mani = _FakeManifest()
     out = dl.download_variable_year(
-        _FakeClient(), "tmax", 2020, [-35.0, -58.5, -30.0, -53.0], "UTC-03:00",
-        manifest=mani, bronze_dir=bronze, b=B, chunk_days=2,
+        _FakeClient(), "tmax", 2020, [-35.0, -58.5, -30.0, -53.0],
+        tz_asset="projects/test/assets/tz", manifest=mani, bronze_dir=bronze, b=B,
+        chunk_days=2,
     )
     assert out.exists()
     assert mani.is_var_year_done("tmax", 2020)

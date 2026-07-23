@@ -22,18 +22,12 @@ CREATE TABLE IF NOT EXISTS wth_base (
     PRIMARY KEY (parent_id, child_id, date)                 -- partition key must be in the PK
 ) PARTITION BY LIST (parent_id);
 
--- Per-cell local-day offset (§5.3). The `date` in wth_base is a LOCAL calendar day, and
--- the offset that defined that day is a per-region download choice — not derivable from
--- longitude. Once regions with different offsets share wth_base, this table is what says
--- which 24-hour window a given cell's `date` means. child_id grain (a parent is always one
--- region, so this is finer than strictly needed, but it matches wth_base's own key and is
--- unambiguous). Populated by transform_silver from its `timezone` param; ON CONFLICT keeps
--- the latest offset if a cell is ever re-loaded under a different one.
-CREATE TABLE IF NOT EXISTS cell_timezone (
-    child_id           CHAR(4)     PRIMARY KEY,
-    utc_offset_minutes SMALLINT    NOT NULL,   -- e.g. UTC-03:00 -> -180, UTC-06:00 -> -360
-    updated_at         TIMESTAMPTZ NOT NULL DEFAULT now()
-);
+-- The `date` in wth_base is a LOCAL calendar day. The offset that defined that 24-hour
+-- window is per-cell and lives on the grid seed as era5_land_base_grid.t_zone (standard UTC
+-- offset in minutes) — derived once from the political tz shapefile and applied at GEE
+-- reduction time (§5.3). query.fetch_cell_series joins the grid to surface it. (Historic:
+-- an earlier per-cell offset table stamped this from a manual transform param; the grid
+-- column replaced it as the single source of truth.)
 
 -- Rows rejected by the QA node (§8.4). Not partitioned: this stays small, and if it does
 -- not, that is the signal to investigate rather than to scale the table.

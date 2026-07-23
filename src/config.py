@@ -58,6 +58,7 @@ class GEEConfig:
     service_account_file: str | None
     gcs_bucket: str | None
     gcs_prefix: str
+    tz_asset: str | None  # EE FeatureCollection of tz polygons w/ `offset` (min); §5.3
 
 
 @dataclass(frozen=True)
@@ -119,6 +120,7 @@ def load_config() -> Config:
             service_account_file=os.getenv("GEE_SERVICE_ACCOUNT_FILE") or None,
             gcs_bucket=os.getenv("GEE_GCS_BUCKET") or None,
             gcs_prefix=os.getenv("GEE_GCS_PREFIX", "bronze-gee"),
+            tz_asset=os.getenv("GEE_TZ_ASSET") or None,
         ),
         paths=PathsConfig(
             data_dir=Path(os.getenv("DATA_DIR", "/data")),

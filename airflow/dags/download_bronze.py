@@ -68,6 +68,11 @@ with DAG(
         "start_year": 1995,
         "end_year": 1995,
         "variables": ["tmax", "tmin", "precip", "srad", "wind_u", "wind_v", "tdew"],
+        # CDS applies this single offset to the WHOLE extent (server-side time_zone). It is
+        # correct only for a single-timezone extent; a multi-country extent must be split
+        # into one run per timezone by hand. The GEE backend (download_bronze_gee) has no
+        # timezone param — it derives the per-cell offset from the grid's t_zone (§5.3) and
+        # is the path for extents spanning several timezones.
         "timezone": "UTC-03:00",
         "data_root": "",    # per-run data root override; blank = env DATA_DIR. Give each
                             # region its own root (e.g. /data/hn) to avoid manifest clashes.

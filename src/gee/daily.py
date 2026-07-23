@@ -8,7 +8,15 @@ Local-day, not UTC (§5.3). GEE's own ``DAILY_AGGR`` aggregates on the UTC day, 
 mix a UTC-day precip total with a local-day temperature extreme. We instead reduce the
 hourly collection over a shifted window: for offset ``o`` hours (Brazil/Uruguay = −3), local
 day ``D`` covers UTC ``[D 00:00 − o, D+1 00:00 − o)`` — i.e. ``[D 03:00Z, D+1 03:00Z)`` for
-−3. The same offset is applied to **every** variable.
+−3.
+
+**Per-cell offset (zones).** An extent spanning several countries has several offsets. Each
+``zone`` is an ``(offset_hours, region)`` pair: reduce over that offset's shifted window and
+``clip`` to its region. The zones are disjoint (they tile the extent by timezone), so
+``mosaic``-ing them yields one daily image where every pixel used its own correct 24 h. The
+zones come from the same tz shapefile that stamps ``era5_land_base_grid.t_zone``, so the
+pixel a cell snaps to and the cell's recorded offset agree by construction. ``region=None``
+means "whole extent, one offset" — the old single-timezone behavior.
 
 The returned collection is lazy; the export step (``src/gee/export.py``) sets the region and
 triggers the actual EECU compute. Keeping this module purely temporal makes it unit-testable
@@ -57,13 +65,20 @@ def _reducer(name: str):
 
 
 def build_daily_collection(
-    variable: str, year: int, *, offset_hours: float
+    variable: str, year: int, *, zones: list[tuple[float, "ee.Geometry | None"]]
 ) -> "ee.ImageCollection":
     """Build the per-local-day ``ee.ImageCollection`` for one ``(variable, year)``.
 
-    Each image is single-band (renamed to the source band) and carries ``system:time_start``
-    and a ``date`` (``YYYY-MM-DD``) property at the local-day start.
+    ``zones`` is a non-empty list of ``(offset_hours, region)`` pairs — one per distinct UTC
+    offset present in the extent. Each day's image is the mosaic of every zone's reduction,
+    each reduced over its own shifted 24 h window and clipped to its region. A single zone
+    with ``region=None`` reproduces the old whole-extent, single-offset behavior. Each image
+    is single-band (the source band) and carries ``system:time_start`` and a ``date``
+    (``YYYY-MM-DD``) property at the local-day start.
     """
+    if not zones:
+        raise ValueError("zones must be non-empty")
+
     spec = variable_spec(variable)
     reducer = _reducer(spec.reducer)
     hourly = ee.ImageCollection(COLLECTION).select(spec.band)
@@ -72,13 +87,22 @@ def build_daily_collection(
     n_days = 366 if calendar.isleap(year) else 365
     band = spec.band
 
-    def _daily(day_index):
-        day_index = ee.Number(day_index)
-        local_start = year_start.advance(day_index, "day")
+    def _zone_image(local_start, offset_hours, region):
         win_start = local_start.advance(-offset_hours, "hour")
         win_end = win_start.advance(24, "hour")
         reduced = hourly.filterDate(win_start, win_end).reduce(reducer).rename(band)
-        return reduced.set(
+        return reduced if region is None else reduced.clip(region)
+
+    def _daily(day_index):
+        day_index = ee.Number(day_index)
+        local_start = year_start.advance(day_index, "day")
+        images = [_zone_image(local_start, off, reg) for off, reg in zones]
+        combined = (
+            images[0]
+            if len(images) == 1
+            else ee.ImageCollection(images).mosaic().rename(band)
+        )
+        return combined.set(
             {
                 "system:time_start": local_start.millis(),
                 "date": local_start.format("YYYY-MM-dd"),
