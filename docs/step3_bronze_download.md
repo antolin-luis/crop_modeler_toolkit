@@ -29,7 +29,7 @@ Decisions inherited from Step 2: doc in `docs/`; reuse `src/grid/encoding` vecto
 | `extent`     | `[S, W, N, E]` in −180/180, snapped to 0.25° cell-center bounds      |
 | `start_year` / `end_year` | inclusive backfill range                               |
 | `variables`  | subset of the silver-name contract (default = all 7)                |
-| `timezone`   | local-day offset (e.g. `UTC-03:00`); same for **all** variables (§5.3)|
+| `timezone`   | one local-day offset for the **whole extent** (e.g. `UTC-03:00`), all variables (§5.3). CDS-only; correct only for a single-timezone extent — for multi-tz use the GEE backend (per-cell `t_zone`, no param) |
 
 ## Variable contract (download side, §5.1)
 
@@ -110,7 +110,8 @@ Use `2m_temperature` extremes, **never** `*_since_previous_post_processing` (§5
 - **No `grid` param** on any request; `area` for subsetting only, snapped to 0.25°
   vertices (§11.1).
 - **Time-first** split; spatial tiling only as last resort (§11.2).
-- Same **local-day** `timezone` for all variables; Brazil = UTC−3 (§5.3).
+- Same **local-day** `timezone` for all variables, one offset for the whole extent (CDS is
+  single-tz; GEE does per-cell `t_zone`, §5.3).
 - Bronze is **raw/unconverted**; conversions are Step 4 (§7).
 - Cap CDS concurrency via an Airflow pool; prefer small sub-ceiling requests (§10, §11.1).
 - Pi memory: stream per time-chunk, write columnar Parquet; don't hold a full extent

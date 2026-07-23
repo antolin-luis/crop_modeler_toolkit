@@ -36,7 +36,8 @@ cp .env.example .env
 
 Edit at minimum `POSTGRES_PASSWORD`, and `CDS_KEY` (format `uid:api-key`) if using CDS.
 `.env` is git-ignored and is the single place configuration lives (PLANNING.md §13).
-For GEE also set `GEE_PROJECT`, `GEE_SERVICE_ACCOUNT_FILE`, `GEE_GCS_BUCKET` — follow
+For GEE also set `GEE_PROJECT`, `GEE_SERVICE_ACCOUNT_FILE`, `GEE_GCS_BUCKET`, and
+`GEE_TZ_ASSET` (the per-cell timezone zones — build it once, §6 of the GEE guide) — follow
 `docs/gee_setup.md` first.
 
 ```bash
@@ -78,7 +79,8 @@ docker compose run --rm airflow-scheduler airflow dags list
 ## 2. The grid (Step 2) — usually nothing to do
 
 `era5_land_base_grid` is the global static grid: 1,038,240 cells, one row per 0.25° cell,
-with `lat`/`lon`/`is_land`/`elevation`/`geom`. It ships as a seed
+with `lat`/`lon`/`is_land`/`elevation`/`t_zone`/`geom` (`t_zone` = per-cell standard UTC
+offset in minutes, the local-day definition, §5.3). It ships as a seed
 (`seeds/era5_land_base_grid.sql.gz`) and **restores automatically on a fresh Postgres
 volume** — `./seeds` is mounted into `/docker-entrypoint-initdb.d`, which Postgres runs
 exactly once at initdb.
@@ -86,7 +88,7 @@ exactly once at initdb.
 ### Verify it (do this before the first silver load)
 
 ```sql
-SELECT count(*), count(elevation) FROM era5_land_base_grid;   -- 1038240 | 1038240
+SELECT count(*), count(elevation), count(t_zone) FROM era5_land_base_grid;  -- 1038240 x3
 SELECT parent_id FROM era5_land_base_grid WHERE child_id = 'EU9K';   -- expect 0XKE
 ```
 
@@ -137,6 +139,9 @@ GEE adds `land_only` (default `True`, clips to land via LSIB) and `chunk_days`
 (default 30 — lower it if the Pi runs short on memory).
 
 ### Trigger it
+
+> **GEE prerequisite:** `GEE_TZ_ASSET` must be set and the timezone asset built once —
+> `download_bronze_gee` raises `GEE_TZ_ASSET is unset` otherwise. See `docs/gee_setup.md` §6.
 
 In the UI: DAG → **Trigger DAG w/ config** → paste the JSON. Or from the CLI:
 

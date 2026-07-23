@@ -127,19 +127,67 @@ printf '{"rule":[{"action":{"type":"Delete"},"condition":{"age":3}}]}' > /tmp/lc
 gcloud storage buckets update gs://your-era5-bronze-export --lifecycle-file=/tmp/lc.json
 ```
 
-## 6. `.env` summary
+## 6. Timezone polygon asset (required before any GEE download)
+
+The GEE backend reduces each cell on its **own** local day (§5.3), so it has **no `timezone`
+DAG param** — it derives one reduction zone per UTC offset present in the extent from a
+timezone-polygon FeatureCollection asset. Build it once from the same political tz shapefile
+that stamps the grid's `t_zone`, so the two agree, and point `GEE_TZ_ASSET` at it. Without it
+`download_bronze_gee` raises `GEE_TZ_ASSET is unset`.
+
+1. Download the boundary set — use the **with-oceans** build so the polygons tile the globe
+   with no coastal gaps (a gap would drop boundary cells from the mosaic):
+
+   ```bash
+   curl -L -o tz-oceans.zip \
+     https://github.com/evansiroky/timezone-boundary-builder/releases/latest/download/timezones-with-oceans.geojson.zip
+   unzip tz-oceans.zip           # -> combined-with-oceans.json
+   ```
+
+2. Dissolve it by standard (non-DST) UTC offset into a **zipped shapefile** — EE table
+   ingestion accepts `.shp`/`.zip`, not GeoJSON. `geopandas` is pulled in just for this
+   maintainer script:
+
+   ```bash
+   uv run --with geopandas python scripts/build_tz_asset.py \
+     --input combined-with-oceans.json --output tz_by_offset.zip
+   ```
+
+3. Ingest it as an EE table asset under your project — reuses the pipeline's service-account
+   auth, so no separate `earthengine`/`gcloud` login:
+
+   ```bash
+   uv run python scripts/ingest_tz_asset.py --input tz_by_offset.zip
+   ```
+
+   It uploads the zip to your GCS bucket, starts the ingestion, polls to `SUCCEEDED`, and
+   prints the asset id.
+
+4. Set it in `.env`:
+
+   ```
+   GEE_TZ_ASSET=projects/<GEE_PROJECT>/assets/tz_by_offset
+   ```
+
+The build inputs/outputs (`combined-with-oceans.json`, `tz_by_offset.zip`, ~50–170 MB) are
+git-ignored — regenerate them, never commit. This is a one-off; every GEE run reuses the
+asset.
+
+## 7. `.env` summary
 
 ```
 GEE_PROJECT=ee-yourusername
 GEE_SERVICE_ACCOUNT_FILE=        # blank = local OAuth; path = headless SA
 GEE_GCS_BUCKET=your-era5-bronze-export
 GEE_GCS_PREFIX=bronze-gee
+GEE_TZ_ASSET=projects/ee-yourusername/assets/tz_by_offset   # tz zones (§6); required for GEE
 ```
 
-All four are optional for CDS-only users; `GEEClient` validates the ones it needs at use
-time. **Never** put key material in `.env` itself — only the *path* to the SA JSON.
+All are optional for CDS-only users; `GEEClient` validates the ones it needs at use time, and
+`download_bronze_gee` checks `GEE_TZ_ASSET` at trigger time. **Never** put key material in
+`.env` itself — only the *path* to the SA JSON.
 
-## 7. Quota, cost, and sizing a real backfill
+## 8. Quota, cost, and sizing a real backfill
 
 - **Read your usage:** the EE task list (<https://code.earthengine.google.com/tasks>) and
   the project's EECU quota page show EECU-hours consumed per export.
