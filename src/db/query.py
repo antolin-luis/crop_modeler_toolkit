@@ -21,7 +21,7 @@ from src.grid.encode_long import DEFAULT_BLOCK_SIZE_B
 
 SERIES_COLUMNS = [
     "date", "tmax", "tmin", "precip", "srad", "wind", "tdew", "rh", "et0",
-    "is_preliminary",
+    "is_preliminary", "utc_offset_minutes",
 ]
 
 
@@ -46,18 +46,25 @@ def fetch_cell_series(
 
     ``conn`` is optional; without one a connection is opened and closed around the query.
     """
-    clauses = ["parent_id = %s", "child_id = %s"]
+    clauses = ["w.parent_id = %s", "w.child_id = %s"]
     params: list[object] = [parent_id, child_id]
     if start is not None:
-        clauses.append("date >= %s")
+        clauses.append("w.date >= %s")
         params.append(start)
     if end is not None:
-        clauses.append("date <= %s")
+        clauses.append("w.date <= %s")
         params.append(end)
 
+    # utc_offset_minutes lives on cell_timezone (§5.3); LEFT JOIN so a cell with no
+    # recorded offset still returns its series (offset simply NULL).
+    select = ", ".join(
+        "tz.utc_offset_minutes" if c == "utc_offset_minutes" else f"w.{c}"
+        for c in SERIES_COLUMNS
+    )
     sql = (
-        f"SELECT {', '.join(SERIES_COLUMNS)} FROM wth_base "
-        f"WHERE {' AND '.join(clauses)} ORDER BY date"
+        f"SELECT {select} FROM wth_base w "
+        "LEFT JOIN cell_timezone tz ON tz.child_id = w.child_id "
+        f"WHERE {' AND '.join(clauses)} ORDER BY w.date"
     )
 
     owned = conn is None

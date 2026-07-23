@@ -27,6 +27,7 @@ def _plan(**context) -> list[dict]:
     timezone = params["timezone"]
     chunk_days = int(params["chunk_days"])
     land_only = bool(params["land_only"])
+    data_root = params.get("data_root") or None
     years = range(int(params["start_year"]), int(params["end_year"]) + 1)
     return [
         {
@@ -36,6 +37,7 @@ def _plan(**context) -> list[dict]:
             "timezone": timezone,
             "chunk_days": chunk_days,
             "land_only": land_only,
+            "data_root": data_root,
         }
         for year in years
         for variable in params["variables"]
@@ -49,15 +51,16 @@ def _download(
     timezone: str,
     chunk_days: int,
     land_only: bool,
+    data_root: str | None = None,
 ) -> str:
-    from src.config import load_config
+    from src.config import resolve_bronze_dir
     from src.gee.client import GEEClient
     from src.gee.download import download_variable_year
 
     # Manifest is shared with the CDS backend: a (variable, year) done by either is done.
     from src.cds.manifest import Manifest
 
-    bronze_dir = load_config().paths.bronze_dir
+    bronze_dir = resolve_bronze_dir(data_root)
     manifest = Manifest.for_bronze_dir(bronze_dir)
     path = download_variable_year(
         GEEClient(),
@@ -87,6 +90,8 @@ with DAG(
         "timezone": "UTC-03:00",
         "chunk_days": 30,   # daily bands held in RAM per encode step (Pi memory lever)
         "land_only": True,  # clip export to land (LSIB); drop masked-ocean cells
+        "data_root": "",    # per-run data root override; blank = env DATA_DIR. Give each
+                            # region its own root (e.g. /data/hn) to avoid manifest clashes.
     },
 ) as dag:
     plan = PythonOperator(

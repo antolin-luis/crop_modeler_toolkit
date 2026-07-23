@@ -86,6 +86,20 @@ class Config:
     paths: PathsConfig
 
 
+def resolve_bronze_dir(data_root: str | Path | None = None) -> Path:
+    """Bronze directory for an optional per-run ``data_root`` override.
+
+    Lets a DAG run point at a different data root (e.g. one country per folder) from its
+    trigger config alone — no container recreate, no ``.env`` edit. With ``data_root``
+    unset (the common case) this is exactly ``load_config().paths.bronze_dir``, so
+    existing single-region runs are unaffected. Each root carries its own ``bronze/`` tree
+    and its own manifest, so regions never collide or overwrite each other.
+    """
+    if data_root:
+        return Path(data_root) / "bronze"
+    return load_config().paths.bronze_dir
+
+
 def load_config() -> Config:
     """Build a Config from the current environment."""
     return Config(
