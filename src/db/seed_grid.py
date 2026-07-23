@@ -69,12 +69,79 @@ def _longitude_offset_minutes(lon: float) -> int:
     return int(round(lon / 15.0)) * 60
 
 
+# How far (in grid cells) a land cell with no tz polygon will search for a resolved political
+# neighbor before giving up and using the solar fallback. 8 cells at 0.25° ≈ 2° — enough to
+# cross an estuary or a coastal water pixel, small enough not to leak an inland zone across a
+# real border.
+_COASTAL_FILL_MAX_RING = 8
+
+
+def _fill_coastal_from_nearest_land(
+    lat: np.ndarray,
+    lon: np.ndarray,
+    out: np.ndarray,
+    resolved_idx: np.ndarray,
+    unresolved_idx: np.ndarray,
+    *,
+    max_ring: int = _COASTAL_FILL_MAX_RING,
+) -> int:
+    """Overwrite each unresolved land cell's offset with its nearest resolved land neighbor's.
+
+    A land cell whose center falls over water (estuary, lake, coastal pixel) gets **no**
+    political polygon from ``timezonefinder`` and would otherwise keep the solar-time offset —
+    which is the maritime offset, not the civil day of the country the cell belongs to (§5.3).
+    We instead adopt the nearest resolved land cell's civil offset.
+
+    The grid is a regular 0.25° lattice, so we index resolved cells by quantized
+    ``(lat, lon)`` and spiral outward ring by ring (Chebyshev radius) until a resolved
+    neighbor is found; among the first ring that yields hits we take the Euclidean-nearest.
+    Returns the number of cells filled (the rest, beyond ``max_ring``, stay solar).
+    """
+    if resolved_idx.size == 0 or unresolved_idx.size == 0:
+        return 0
+
+    q = 1.0 / RESOLUTION
+    grid: dict[tuple[int, int], int] = {}
+    for i in resolved_idx:
+        key = (round(lat[i] * q), round(lon[i] * q))
+        grid.setdefault(key, int(out[i]))  # first resolved cell at a lattice node wins
+
+    filled = 0
+    for i in unresolved_idx:
+        qlat = round(lat[i] * q)
+        qlon = round(lon[i] * q)
+        found_offset: int | None = None
+        for r in range(1, max_ring + 1):
+            best_d2 = None
+            for dlat in range(-r, r + 1):
+                for dlon in range(-r, r + 1):
+                    if max(abs(dlat), abs(dlon)) != r:  # perimeter of ring r only
+                        continue
+                    off = grid.get((qlat + dlat, qlon + dlon))
+                    if off is None:
+                        continue
+                    d2 = dlat * dlat + dlon * dlon
+                    if best_d2 is None or d2 < best_d2:
+                        best_d2 = d2
+                        found_offset = off
+            if found_offset is not None:
+                break
+        if found_offset is not None:
+            out[i] = found_offset
+            filled += 1
+    return filled
+
+
 def assign_timezone(lat, lon, is_land) -> np.ndarray:
     """Per-cell standard UTC offset (minutes) from the political tz shapefile (§5.3).
 
     Land cells resolve their IANA zone by cell center via ``timezonefinder``, then map to a
-    standard offset. Non-land cells (bronze is land-only) and land points outside every tz
-    polygon fall back to the longitude solar offset. Returns an ``int16`` array.
+    standard offset. A land cell whose center falls over water (estuary/lake/coast) gets no
+    polygon; it inherits the nearest resolved land cell's civil offset
+    (:func:`_fill_coastal_from_nearest_land`) so it keeps the country's civil day rather than a
+    maritime solar offset. Genuine ocean cells (bronze is land-only) and land cells with no
+    resolved neighbor within the search cap fall back to the longitude solar offset. Returns an
+    ``int16`` array.
 
     The ~700k ocean cells get the solar fallback **vectorized** (instant); only the ~300k
     land cells pay the per-point ``timezonefinder`` lookup. We use ``TimezoneFinderL`` (the
@@ -96,22 +163,37 @@ def assign_timezone(lat, lon, is_land) -> np.ndarray:
 
     land_idx = np.flatnonzero(is_land)
     total = land_idx.size
+    resolved: list[int] = []    # land cells that got a political offset
+    unresolved: list[int] = []  # land cells with no polygon -> coastal fill, then solar
     unknown: dict[str, int] = {}  # tzid the local tzdata lacks -> cell count (solar fallback)
     print(f"assign_timezone: {total:,} land cells to resolve...", flush=True)
     for k, i in enumerate(land_idx):
+        i = int(i)
         tzid = tf.timezone_at(lng=float(lon[i]), lat=float(lat[i]))
         if tzid:
             try:
                 out[i] = std_offset_minutes(tzid)
+                resolved.append(i)
             except ZoneInfoNotFoundError:
                 # tzid newer than the container's tzdata (e.g. America/Coyhaique). Keep the
                 # solar fallback already in out[i] and report it; upgrade tzdata for exactness.
                 unknown[tzid] = unknown.get(tzid, 0) + 1
+                unresolved.append(i)
+        else:
+            unresolved.append(i)
         if k and k % 50_000 == 0:
             print(f"assign_timezone: {k:,}/{total:,} land cells", flush=True)
+
+    filled = _fill_coastal_from_nearest_land(
+        lat, lon, out, np.asarray(resolved, dtype=np.int64),
+        np.asarray(unresolved, dtype=np.int64),
+    )
+    if filled:
+        print(f"assign_timezone: {filled:,} coastal land cells filled from nearest political "
+              f"neighbor (of {len(unresolved):,} with no polygon)", flush=True)
     if unknown:
-        print(f"assign_timezone: {sum(unknown.values()):,} cells fell back to solar for "
-              f"tzids missing from local tzdata: {sorted(unknown)}", flush=True)
+        print(f"assign_timezone: {sum(unknown.values()):,} cells hit a tzid missing from local "
+              f"tzdata (coastal-filled or solar): {sorted(unknown)}", flush=True)
     return out
 
 

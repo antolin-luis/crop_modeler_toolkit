@@ -11,6 +11,7 @@ import xarray as xr
 
 from src.db.seed_grid import (
     GRAVITY,
+    _fill_coastal_from_nearest_land,
     _longitude_offset_minutes,
     assign_timezone,
     build_rows,
@@ -111,6 +112,44 @@ def test_assign_timezone_land_uses_shapefile_ocean_uses_longitude():
     assert out.dtype == np.int16
     assert out[0] == -180
     assert out[1] == _longitude_offset_minutes(-140.0)  # solar fallback, not a tz polygon
+
+
+def test_assign_timezone_isolated_ocean_land_stays_solar():
+    # A land-flagged cell over open ocean with no resolved land neighbor keeps the solar
+    # fallback (nothing to fill from).
+    out = assign_timezone([0.0], [-140.0], [True])
+    assert out[0] == _longitude_offset_minutes(-140.0)
+
+
+def test_fill_coastal_from_nearest_land_within_cap_only():
+    # Regular 0.25° lattice: a resolved land cell (offset -180), an unresolved neighbor one
+    # cell away (inherits it), and an unresolved cell 20 cells away (> 8-cell cap, untouched).
+    lat = np.array([0.0, 0.0, 0.0])
+    lon = np.array([0.0, 0.25, 5.0])
+    SOLAR = np.int16(-999)  # sentinel standing in for the solar fallback already in `out`
+    out = np.array([-180, SOLAR, SOLAR], dtype=np.int16)
+    resolved = np.array([0], dtype=np.int64)
+    unresolved = np.array([1, 2], dtype=np.int64)
+
+    filled = _fill_coastal_from_nearest_land(lat, lon, out, resolved, unresolved)
+
+    assert filled == 1
+    assert out[1] == -180      # adjacent coastal cell inherits the political offset
+    assert out[2] == SOLAR     # beyond the ring cap -> keeps its solar fallback
+
+
+def test_fill_coastal_picks_nearest_when_two_offsets_reach():
+    # Two resolved land cells with different offsets; the unresolved water cell adopts the
+    # geometrically nearer one.
+    lat = np.array([0.0, 0.0, 0.0])
+    lon = np.array([0.0, 1.0, 0.25])   # idx2 (unresolved) is 1 cell from idx0, 3 from idx1
+    out = np.array([-180, -240, np.int16(0)], dtype=np.int16)
+    resolved = np.array([0, 1], dtype=np.int64)
+    unresolved = np.array([2], dtype=np.int64)
+
+    _fill_coastal_from_nearest_land(lat, lon, out, resolved, unresolved)
+
+    assert out[2] == -180  # nearest resolved land, not the farther -240
 
 
 def test_build_rows_has_t_zone(geopotential, land_mask):
