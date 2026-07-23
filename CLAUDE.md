@@ -60,7 +60,7 @@ Steps 3–4 gate on the user — never self-authorize the commit/PR/merge/delete
 Medallion architecture with three layers:
 
 - **Bronze** — Parquet on disk (`/data/bronze/`), one file per variable per year. Raw ERA5 values, unconverted.
-- **Silver** — PostgreSQL 16 + PostGIS. Two tables: `era5_land_base_grid` (global static geometry) and `wth_base` (wide daily observations, partitioned by `parent_id`).
+- **Silver** — PostgreSQL 16 + PostGIS. Two tables: `era5_land_base_grid` (global static geometry + per-cell `t_zone` local-day offset) and `wth_base` (wide daily observations, partitioned by `parent_id`).
 - **Gold** — DSSAT `.WTH` files, materialized on demand. Partially specified; header fields (`TAV`/`AMP`/`ELEV`) are deferred.
 
 Orchestration is four Airflow DAGs: `grid_build` (one-off seed), `download_bronze`, `transform_silver`, `update` (daily append + ERA5T rolling re-fetch).
@@ -83,7 +83,7 @@ A shifted origin silently produces divergent codes across regions.
 
 **Temperature variables.** Use `2m_temperature` with `daily_maximum`/`daily_minimum` — do **not** use `maximum_2m_temperature_since_previous_post_processing` or its minimum counterpart. As of June 2026 those parameters have an open data-quality issue and carry a forecast cold bias.
 
-**Day definition.** All variables must use the same local-day timezone (not UTC). Brazil = UTC−3. Apply consistently to avoid mixing UTC-day precip with local-day temperature.
+**Day definition.** Local day, not UTC — and the offset is **per cell**, carried on `era5_land_base_grid.t_zone` (standard non-DST UTC offset, minutes; from the political tz shapefile at seed time). All variables of a cell share that one offset (avoid mixing UTC-day precip with local-day temperature). The GEE backend derives its reduction windows per-offset from a tz-polygon EE asset (`GEE_TZ_ASSET`) and takes **no** `timezone` param; CDS still takes a single `timezone` for the whole extent (correct only for single-tz extents). Daily reduction is lossy — apply the offset at reduction, never convert a daily value between timezones after the fact.
 
 **Elevation.** Derived from geopotential: `elevation_m = z / 9.80665`. Use the 0.25° model orography for ET0 — do not substitute a high-res DEM.
 
