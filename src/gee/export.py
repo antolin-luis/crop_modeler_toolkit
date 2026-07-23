@@ -61,6 +61,35 @@ def _land_region(extent: list[float], *, max_error: float = 1000.0) -> "ee.Geome
     return land.intersection(bbox, maxError=max_error)
 
 
+def tz_zones(
+    extent: list[float], tz_asset: str, *, max_error: float = 1000.0
+) -> list[tuple[float, "ee.Geometry"]]:
+    """Per-offset ``(offset_hours, region)`` zones covering ``extent`` (PLANNING.md §5.3).
+
+    Reads the tz-polygon asset (property ``offset`` = standard UTC offset in minutes; built
+    by ``scripts/build_tz_asset.py`` from the same shapefile that stamps the grid's
+    ``t_zone``), keeps only offsets present in the extent bbox, and returns each offset's
+    region clipped to the bbox. The one ``getInfo`` here (the distinct offset list) is why
+    this lives in the export module, not the pure-graph ``daily`` module. Feed the result to
+    ``daily.build_daily_collection(zones=...)``.
+    """
+    bbox = _region(extent)
+    fc = ee.FeatureCollection(tz_asset).filterBounds(bbox)
+    offsets = fc.aggregate_array("offset").distinct().getInfo()
+    if not offsets:
+        raise RuntimeError(
+            f"tz asset {tz_asset!r} yields no offsets over extent {extent}; "
+            "check the asset path and its `offset` property"
+        )
+    zones = []
+    for off_min in sorted(offsets):
+        region = fc.filter(ee.Filter.eq("offset", off_min)).geometry().intersection(
+            bbox, maxError=max_error
+        )
+        zones.append((off_min / 60.0, region))
+    return zones
+
+
 def start_export(
     daily_col: "ee.ImageCollection",
     extent: list[float],

@@ -26,11 +26,12 @@ from pathlib import Path
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from src.gee.daily import build_daily_collection, parse_offset_hours
+from src.gee.daily import build_daily_collection
 from src.gee.export import (
     download_prefix,
     iter_geotiff_chunks,
     start_export,
+    tz_zones,
     wait_for_task,
 )
 from src.grid.encode_long import DEFAULT_BLOCK_SIZE_B, encode_grid
@@ -41,8 +42,8 @@ def download_variable_year(
     variable: str,
     year: int,
     extent: list[float],
-    timezone: str,
     *,
+    tz_asset: str,
     manifest,
     bronze_dir: str | Path,
     b: int = DEFAULT_BLOCK_SIZE_B,
@@ -51,19 +52,22 @@ def download_variable_year(
 ) -> Path:
     """Download one ``(variable, year)`` to ``bronze/<var>/<var>_<year>.parquet``.
 
-    ``client`` is a connected :class:`src.gee.client.GEEClient`. Idempotent: returns the
-    existing Parquet if the manifest already marks the pair done. ``chunk_days`` caps how
-    many daily bands are held in RAM per encode step; ``land_only`` clips the export to land
-    (masked ocean cells are dropped). Bronze row order is unspecified — the streamed write
-    can't globally sort, and silver upserts on ``(parent_id, child_id, date)`` regardless.
+    ``client`` is a connected :class:`src.gee.client.GEEClient`. The local-day 24 h window is
+    per-cell: ``tz_asset`` (the tz-polygon EE asset) is intersected with ``extent`` to derive
+    one reduction zone per UTC offset present — no manual timezone input, correct for extents
+    spanning several countries. Idempotent: returns the existing Parquet if the manifest
+    already marks the pair done. ``chunk_days`` caps how many daily bands are held in RAM per
+    encode step; ``land_only`` clips the export to land (masked ocean cells are dropped).
+    Bronze row order is unspecified — the streamed write can't globally sort, and silver
+    upserts on ``(parent_id, child_id, date)`` regardless.
     """
     out_dir = Path(bronze_dir) / variable
     out_path = out_dir / f"{variable}_{year}.parquet"
     if manifest.is_var_year_done(variable, year) and out_path.exists():
         return out_path
 
-    offset = parse_offset_hours(timezone)
-    daily_col = build_daily_collection(variable, year, offset_hours=offset)
+    zones = tz_zones(extent, tz_asset)
+    daily_col = build_daily_collection(variable, year, zones=zones)
 
     bucket = client.require_bucket()
     name_prefix = f"{client.gcs_prefix}/{variable}_{year}"

@@ -32,3 +32,10 @@ __pycache__/
 
 # Committed exception: the shipped grid seed IS tracked on purpose (the
 # distribution artifact). seeds/ is not ignored; keep it as the sole large blob.
+
+# Timezone shapefile build artifacts (scripts/build_tz_asset.py inputs/outputs) —
+# large; regenerate from timezone-boundary-builder, never commit (GEE_TZ_ASSET is the
+# shipped form, held in Earth Engine, not git).
+combined-with-oceans.json
+tz-oceans.zip
+tz_by_offset.*

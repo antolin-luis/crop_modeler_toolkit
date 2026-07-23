@@ -115,14 +115,23 @@ static `.nc` inputs and is not part of normal operation.
 One Parquet per variable per year under `/data/bronze/<var>/<var>_<year>.parquet`, holding
 **raw ERA5 values** (Kelvin, metres, J/m²) — conversions are Step 4's job.
 
-Both DAGs take the same parameters:
+Both DAGs share these parameters:
 
 | Param | Meaning |
 |---|---|
 | `extent` | `[S, W, N, E]` in −180/180, snapped to 0.25° |
 | `start_year` / `end_year` | inclusive |
 | `variables` | subset of the 7: `tmax tmin precip srad wind_u wind_v tdew` |
-| `timezone` | local-day offset — **the same for every variable** (§5.3); Uruguay/Brazil = `UTC-03:00` |
+
+**Timezone differs by backend:**
+
+- **GEE (`download_bronze_gee`) has no `timezone` param.** The local-day 24 h window is
+  **per-cell**: it derives one reduction zone per UTC offset present in the extent from the
+  tz-polygon asset (`GEE_TZ_ASSET`), which matches each cell's `era5_land_base_grid.t_zone`
+  (§5.3). A multi-country extent is therefore correct in one run. (One-time setup:
+  `scripts/build_tz_asset.py` → see step 3b doc.)
+- **CDS (`download_bronze`) keeps a single `timezone`** applied to the whole extent —
+  correct only for a single-timezone extent; split a multi-tz extent into one run per zone.
 
 GEE adds `land_only` (default `True`, clips to land via LSIB) and `chunk_days`
 (default 30 — lower it if the Pi runs short on memory).
@@ -134,10 +143,10 @@ In the UI: DAG → **Trigger DAG w/ config** → paste the JSON. Or from the CLI
 ```bash
 docker compose run --rm airflow-scheduler \
   airflow dags trigger download_bronze_gee \
-  -c '{"extent":[-35,-58,-30,-53],"start_year":2020,"end_year":2020,"timezone":"UTC-03:00"}'
+  -c '{"extent":[-35,-58,-30,-53],"start_year":2020,"end_year":2020}'
 ```
 
-Substitute `download_bronze` for the CDS backend (same conf, minus the GEE-only keys).
+For the CDS backend use `download_bronze` and add `"timezone":"UTC-03:00"`.
 
 > **Always pass an extent.** The default is the whole globe. A global backfill is not
 > what you want as a first run.
@@ -244,8 +253,9 @@ by the `data_root` param — no `.env` edit, no container restart:
 
 ```bash
 # Honduras -> /data/hn (i.e. ./.localdata/hn/bronze); Uruguay stays on the default /data.
+# No timezone param on GEE — Honduras cells get UTC-6 from their grid t_zone automatically.
 docker compose run --rm airflow-scheduler airflow dags trigger download_bronze_gee \
-  -c '{"extent":[12.9,-89.4,16.6,-83.1],"start_year":1980,"end_year":2026,"timezone":"UTC-06:00","data_root":"/data/hn"}'
+  -c '{"extent":[12.9,-89.4,16.6,-83.1],"start_year":1980,"end_year":2026,"data_root":"/data/hn"}'
 
 docker compose run --rm airflow-scheduler airflow dags trigger transform_silver \
   -c '{"start_year":1980,"end_year":2026,"data_root":"/data/hn"}'
@@ -264,17 +274,17 @@ bronze parquet" for years it cannot see. Finish a region end-to-end with a consi
 regions coexist in one table and one query API — Honduras cells simply land in their own
 `parent_id` partitions.
 
-**Local-day offset is recorded per cell.** `date` in `wth_base` is a *local* calendar day,
-and the offset that defined it is a per-region download choice (Honduras UTC−6, Uruguay
-UTC−3) — not derivable from longitude. The transform writes it, from its `timezone` param,
-into the `cell_timezone` table (`child_id → utc_offset_minutes`, e.g. −360 / −180), and
-`fetch_series` returns it as a column. So a mixed-region database is unambiguous: every
-cell's series carries the 24-hour window its dates mean. Pass the region's `timezone` in the
-transform trigger config just as you do for the download.
+**Local-day offset is per cell, on the grid.** `date` in `wth_base` is a *local* calendar
+day, and the offset that defined it (Honduras UTC−6, Uruguay UTC−3) lives on
+`era5_land_base_grid.t_zone` — assigned once from the political tz shapefile at seed time and
+applied at GEE reduction. No transform param, no separate table: GEE reduces each cell over
+its own 24 h window, and `fetch_series` returns the offset as a column via a grid join. A
+mixed-region database is unambiguous with **nothing to pass** — a single multi-country run is
+already correct.
 
 ```sql
 -- which offsets are present, and how many cells each
-SELECT utc_offset_minutes, count(*) FROM cell_timezone GROUP BY 1 ORDER BY 1;
+SELECT t_zone, count(*) FROM era5_land_base_grid WHERE is_land GROUP BY 1 ORDER BY 1;
 ```
 
 > **Still open.** The manifest key is `variable:year` with no region, so a *new* extent over
@@ -301,8 +311,8 @@ driver, accept.
 
 > **Expect clutter.** Airflow stores its own metadata in this same database, so `public`
 > holds ~40 `dag*` / `task*` / `ab_*` tables alongside ours. The ones that matter are
-> `era5_land_base_grid`, `wth_base`, `wth_qa_failures`, `cell_timezone`, and the `wth_0XXX`
-> partitions.
+> `era5_land_base_grid` (carries per-cell `t_zone`), `wth_base`, `wth_qa_failures`, and the
+> `wth_0XXX` partitions.
 >
 > **Do not expose port 5432 to the internet** — the password is whatever you typed in
 > `.env` and there is no TLS in front of it. Keep it on the LAN or behind a tunnel.

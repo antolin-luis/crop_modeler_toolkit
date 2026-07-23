@@ -14,7 +14,9 @@ from __future__ import annotations
 
 import argparse
 import io
+from datetime import datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import numpy as np
 import pandas as pd
@@ -30,7 +32,87 @@ GRAVITY = 9.80665  # m/s^2 — geopotential -> elevation (§5.4)
 TABLE = "era5_land_base_grid"
 STAGING = "_grid_staging"
 SCHEMA_SQL = Path(__file__).with_name("schema.sql")
-_COLUMNS = ["child_id", "parent_id", "lat", "lon", "is_land", "elevation"]
+_COLUMNS = ["child_id", "parent_id", "lat", "lon", "is_land", "elevation", "t_zone"]
+
+# tzid -> standard UTC offset (minutes). Populated on demand; a handful of distinct
+# zones cover the whole grid, so caching turns ~1M cell lookups into a few dozen.
+_STD_OFFSET_CACHE: dict[str, int] = {}
+
+
+def std_offset_minutes(tzid: str) -> int:
+    """Standard (non-DST) UTC offset in minutes for an IANA ``tzid`` (§5.3).
+
+    The pipeline is DST-free (ERA5 is a fixed grid; a cell's local day must not jump an
+    hour twice a year), so we take each zone's *standard* offset — the Jan/Jul sample whose
+    ``dst()`` is zero. Zones without DST return their single offset; the rare zone with no
+    non-DST month in the sample falls back to the smaller-magnitude of the two.
+    """
+    cached = _STD_OFFSET_CACHE.get(tzid)
+    if cached is not None:
+        return cached
+    tz = ZoneInfo(tzid)
+    offsets = []
+    for month in (1, 7):
+        dt = datetime(2023, month, 1, tzinfo=tz)
+        off = int(dt.utcoffset().total_seconds() // 60)
+        if dt.dst() == timedelta(0):
+            _STD_OFFSET_CACHE[tzid] = off
+            return off
+        offsets.append(off)
+    off = min(offsets, key=abs)
+    _STD_OFFSET_CACHE[tzid] = off
+    return off
+
+
+def _longitude_offset_minutes(lon: float) -> int:
+    """Solar-time fallback offset (minutes) for cells with no tz polygon (ocean/islands)."""
+    return int(round(lon / 15.0)) * 60
+
+
+def assign_timezone(lat, lon, is_land) -> np.ndarray:
+    """Per-cell standard UTC offset (minutes) from the political tz shapefile (§5.3).
+
+    Land cells resolve their IANA zone by cell center via ``timezonefinder``, then map to a
+    standard offset. Non-land cells (bronze is land-only) and land points outside every tz
+    polygon fall back to the longitude solar offset. Returns an ``int16`` array.
+
+    The ~700k ocean cells get the solar fallback **vectorized** (instant); only the ~300k
+    land cells pay the per-point ``timezonefinder`` lookup. We use ``TimezoneFinderL`` (the
+    bundled H3-shortcut variant) not the full polygon ``TimezoneFinder``: the latter does a
+    point-in-polygon test per call that is ~100× slower (minutes → hours on the Pi target),
+    and at 0.25° the H3 answer is identical except for a thin band of border cells — well
+    within the boundary approximation we already accept. Progress is printed so the build is
+    visibly alive.
+    """
+    from timezonefinder import TimezoneFinderL
+
+    tf = TimezoneFinderL()
+    lat = np.asarray(lat, dtype=np.float64).ravel()
+    lon = np.asarray(lon, dtype=np.float64).ravel()
+    is_land = np.asarray(is_land, dtype=bool).ravel()
+
+    # Vectorized solar fallback for every cell; land cells overwritten below.
+    out = (np.round(lon / 15.0).astype(np.int64) * 60).astype(np.int16)
+
+    land_idx = np.flatnonzero(is_land)
+    total = land_idx.size
+    unknown: dict[str, int] = {}  # tzid the local tzdata lacks -> cell count (solar fallback)
+    print(f"assign_timezone: {total:,} land cells to resolve...", flush=True)
+    for k, i in enumerate(land_idx):
+        tzid = tf.timezone_at(lng=float(lon[i]), lat=float(lat[i]))
+        if tzid:
+            try:
+                out[i] = std_offset_minutes(tzid)
+            except ZoneInfoNotFoundError:
+                # tzid newer than the container's tzdata (e.g. America/Coyhaique). Keep the
+                # solar fallback already in out[i] and report it; upgrade tzdata for exactness.
+                unknown[tzid] = unknown.get(tzid, 0) + 1
+        if k and k % 50_000 == 0:
+            print(f"assign_timezone: {k:,}/{total:,} land cells", flush=True)
+    if unknown:
+        print(f"assign_timezone: {sum(unknown.values()):,} cells fell back to solar for "
+              f"tzids missing from local tzdata: {sorted(unknown)}", flush=True)
+    return out
 
 
 def load_elevation(geopotential_nc: str | Path | xr.Dataset | xr.DataArray) -> np.ndarray:
@@ -76,14 +158,16 @@ def build_rows(
     lon = lon_idx * RESOLUTION
     lon = np.where(lon > 180.0, lon - 360.0, lon)               # store as -180..180
 
+    is_land_flat = is_land.ravel()
     return pd.DataFrame(
         {
             "child_id": cell_codes(lat_idx, lon_idx),
             "parent_id": parent_codes(lat_idx, lon_idx, b),
             "lat": lat,
             "lon": lon,
-            "is_land": is_land.ravel(),
+            "is_land": is_land_flat,
             "elevation": elev.ravel(),
+            "t_zone": assign_timezone(lat, lon, is_land_flat),
         }
     )
 
@@ -96,7 +180,8 @@ def load_grid(conn, df: pd.DataFrame, *, chunk_rows: int = 100_000) -> None:
         cur.execute(
             f"CREATE TEMP TABLE {STAGING} ("
             "child_id CHAR(4), parent_id CHAR(4), lat DOUBLE PRECISION, "
-            "lon DOUBLE PRECISION, is_land BOOLEAN, elevation DOUBLE PRECISION"
+            "lon DOUBLE PRECISION, is_land BOOLEAN, elevation DOUBLE PRECISION, "
+            "t_zone SMALLINT"
             ") ON COMMIT DROP"
         )
 
@@ -111,8 +196,8 @@ def load_grid(conn, df: pd.DataFrame, *, chunk_rows: int = 100_000) -> None:
     with conn.cursor() as cur:
         cur.execute(
             f"INSERT INTO {TABLE} "
-            "(child_id, parent_id, lat, lon, is_land, elevation, geom) "
-            "SELECT child_id, parent_id, lat, lon, is_land, elevation, "
+            "(child_id, parent_id, lat, lon, is_land, elevation, t_zone, geom) "
+            "SELECT child_id, parent_id, lat, lon, is_land, elevation, t_zone, "
             "ST_MakeEnvelope(lon-0.125, lat-0.125, lon+0.125, lat+0.125, 4326) "
             f"FROM {STAGING}"
         )

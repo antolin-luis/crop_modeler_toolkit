@@ -17,7 +17,13 @@ USER airflow
 RUN pip install --no-cache-dir \
     --constraint "https://raw.githubusercontent.com/apache/airflow/constraints-${AIRFLOW_VERSION}/constraints-${PYTHON_VERSION}.txt" \
     numpy pandas pyarrow xarray netCDF4 cfgrib cdsapi psycopg2-binary python-dotenv \
-    earthengine-api google-cloud-storage rioxarray rasterio
+    earthengine-api google-cloud-storage rioxarray rasterio \
+    timezonefinder
+
+# tzdata upgraded WITHOUT the Airflow constraint: the pinned version lags timezonefinder's
+# boundary data, which returns newest IANA zones (e.g. America/Coyhaique, 2024) that an old
+# tzdata's zoneinfo can't resolve — seed_grid needs the standard offset for every zone it sees.
+RUN pip install --no-cache-dir --upgrade tzdata
 
 # src/ and dags/ are bind-mounted at runtime (see docker-compose.yml); PYTHONPATH
 # makes `import src...` resolve inside the container.

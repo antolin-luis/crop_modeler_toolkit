@@ -75,17 +75,19 @@ def test_query_is_partition_pruned_and_ordered():
     assert "w.parent_id = %s AND w.child_id = %s" in sql  # partition key leads
     assert sql.endswith("ORDER BY w.date")
     assert params == [parent_code(*MONTEVIDEO, B), cell_code(*MONTEVIDEO)]
-    assert "era5_land_base_grid" not in sql  # no grid join
     assert "ST_" not in sql                  # no PostGIS
 
 
-def test_query_left_joins_cell_timezone():
+def test_query_left_joins_grid_for_offset():
     conn = FakeConn()
     query.fetch_series(*MONTEVIDEO, conn=conn)
 
     sql, _ = conn.log[0]
-    assert "LEFT JOIN cell_timezone tz ON tz.child_id = w.child_id" in sql
-    assert "tz.utc_offset_minutes" in sql
+    # utc_offset_minutes now comes from the grid's t_zone (single source of truth), via a
+    # cheap PK LEFT JOIN — not the retired cell_timezone table.
+    assert "LEFT JOIN era5_land_base_grid g ON g.child_id = w.child_id" in sql
+    assert "g.t_zone" in sql
+    assert "cell_timezone" not in sql
 
 
 def test_date_bounds_are_optional_and_parameterized():

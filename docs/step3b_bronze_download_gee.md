@@ -57,24 +57,39 @@ Two correctness wins over the CDS contract:
 > <https://developers.google.com/earth-engine/datasets/catalog/ECMWF_ERA5_HOURLY>.
 > `src/gee/variables.py` is the single place to adjust.
 
-## Local-day window (§5.3)
+## Local-day window, per cell (§5.3)
 
-For a `timezone` offset of `o` hours (Brazil/Uruguay = `UTC-03:00` → `o = −3`), local day
-`D` covers UTC `[D 00:00 − o, D+1 00:00 − o)` — i.e. `[D 03:00Z, D+1 03:00Z)` for −3. The
-**same** offset applies to every variable. `parse_offset_hours` accepts the identical
-`UTC±HH:MM` string the CDS path uses.
+For offset `o` hours, local day `D` covers UTC `[D 00:00 − o, D+1 00:00 − o)` — i.e.
+`[D 03:00Z, D+1 03:00Z)` for −3. The offset is **per cell, not a run parameter**: there is no
+`timezone` param. `download_variable_year` reads the tz-polygon asset (`GEE_TZ_ASSET`),
+intersects it with the extent, and builds one reduction **zone** `(offset_hours, region)` per
+UTC offset present (`export.tz_zones`). `build_daily_collection(zones=...)` reduces each
+zone over its own shifted window, clips to its region, and mosaics the disjoint zones into
+one daily image. So an extent spanning several timezones is correct in a single run, and the
+window each cell used matches its `era5_land_base_grid.t_zone` (both come from the same tz
+shapefile — see setup below). The same offset still applies to every *variable* of a cell.
+
+### One-time setup: the tz asset
+`scripts/build_tz_asset.py` dissolves the timezone-boundary-builder polygons by **standard**
+(non-DST) UTC offset — the exact mapping `seed_grid.std_offset_minutes` stamps into the grid's
+`t_zone` — and writes a GeoJSON to upload as an EE table asset (property `offset` = minutes).
+Use the *combined-with-oceans* boundary set so zones tile the globe with no coastal gaps. Set
+`GEE_TZ_ASSET=projects/<ee-project>/assets/tz_by_offset` in `.env`.
 
 ## Files
 
 - `src/gee/variables.py` — silver-name → `(band, reducer)`, `COLLECTION="ECMWF/ERA5/HOURLY"`.
   Silver keys mirror `src/cds/variables.py`.
-- `src/gee/daily.py` — `build_daily_collection(variable, year, *, offset_hours)` builds the
-  per-local-day `ee.ImageCollection` (pure server-side graph; no I/O). `parse_offset_hours`.
+- `src/gee/daily.py` — `build_daily_collection(variable, year, *, zones)` builds the
+  per-local-day `ee.ImageCollection`, mosaicking one clipped reduction per `(offset, region)`
+  zone (pure server-side graph; no I/O). `parse_offset_hours` (retained utility).
+- `scripts/build_tz_asset.py` — maintainer one-off: build the tz-by-offset EE asset.
 - `src/gee/client.py` — `GEEClient`: `ee.Initialize` from `GEEConfig` (service account if
   `GEE_SERVICE_ACCOUNT_FILE` set, else stored user OAuth).
 - `src/gee/export.py` — flatten the collection to a date-named multi-band image, export to
   GCS aligned to the canonical grid (`crsTransform`, the GEE analogue of "never regrid"),
-  poll the task to completion with backoff, download the shard(s). Two read paths:
+  poll the task to completion with backoff, download the shard(s). `tz_zones(extent, asset)`
+  derives the per-offset reduction zones (the one `getInfo` on this path). Two read paths:
   `iter_geotiff_chunks` (streams band-windows — the production path) and `read_daily_geotiffs`
   (whole-load — small rasters/tests). `start_export(land_only=True)` clips the export region
   to land (LSIB) so EE skips interior-ocean tiles.
@@ -96,7 +111,8 @@ For a `timezone` offset of `o` hours (Brazil/Uruguay = `UTC-03:00` → `o = −3
 - **0.25° ERA5 only** — keeps `child_id` compatible; `src/grid/spec.py` unchanged.
 - **No regridding** — export at native resolution via `crsTransform`; `encode_grid` snaps
   to nearest index for any residual offset.
-- **Local-day** window, same offset for all variables (§5.3).
+- **Local-day** window, per-cell offset from the grid `t_zone`; same offset for all
+  variables of a cell (§5.3).
 - **Bronze is raw** — only temporal aggregation server-side; units stay native (Step 4
   converts).
 - **Daily sanity** — exactly one value per cell per day before writing.
@@ -104,10 +120,11 @@ For a `timezone` offset of `o` hours (Brazil/Uruguay = `UTC-03:00` → `o = −3
 ## Running it
 
 1. Complete `docs/gee_setup.md` (project, auth, GCS bucket, `.env`).
-2. Create the pool once: `airflow pools set gee_pool 2 "GEE export cap"`.
-3. Trigger `download_bronze_gee` with `extent` `[S, W, N, E]`, `start_year`/`end_year`,
-   `variables`, `timezone` (e.g. `UTC-03:00`), plus `land_only` (default True — clip to land,
-   drop ocean) and `chunk_days` (default 30 — lower it if memory is tight on the Pi).
+2. Build + upload the tz asset (once) and set `GEE_TZ_ASSET` — see "One-time setup" above.
+3. Create the pool once: `airflow pools set gee_pool 2 "GEE export cap"`.
+4. Trigger `download_bronze_gee` with `extent` `[S, W, N, E]`, `start_year`/`end_year`,
+   `variables`, plus `land_only` (default True — clip to land, drop ocean) and `chunk_days`
+   (default 30 — lower it if memory is tight on the Pi). **No `timezone`** — it is per-cell.
 4. Stay under the monthly EECU quota by **splitting the year range across runs** (there is
    no per-request cost ceiling to probe, so no adaptive splitter — the year range is the
    one lever). See `docs/gee_setup.md` §7.

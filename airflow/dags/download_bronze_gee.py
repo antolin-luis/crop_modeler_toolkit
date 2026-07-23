@@ -24,7 +24,6 @@ def _plan(**context) -> list[dict]:
     """Build the year-major, variable-minor list of per-task op_kwargs."""
     params = context["params"]
     extent = [float(v) for v in params["extent"]]
-    timezone = params["timezone"]
     chunk_days = int(params["chunk_days"])
     land_only = bool(params["land_only"])
     data_root = params.get("data_root") or None
@@ -34,7 +33,6 @@ def _plan(**context) -> list[dict]:
             "variable": variable,
             "year": year,
             "extent": extent,
-            "timezone": timezone,
             "chunk_days": chunk_days,
             "land_only": land_only,
             "data_root": data_root,
@@ -48,17 +46,22 @@ def _download(
     variable: str,
     year: int,
     extent: list,
-    timezone: str,
     chunk_days: int,
     land_only: bool,
     data_root: str | None = None,
 ) -> str:
-    from src.config import resolve_bronze_dir
+    # No timezone param: the per-cell local-day offset comes from the tz-polygon asset,
+    # derived per UTC offset present in the extent (src/gee/export.tz_zones). §5.3.
+    from src.config import load_config, resolve_bronze_dir
     from src.gee.client import GEEClient
     from src.gee.download import download_variable_year
 
     # Manifest is shared with the CDS backend: a (variable, year) done by either is done.
     from src.cds.manifest import Manifest
+
+    tz_asset = load_config().gee.tz_asset
+    if not tz_asset:
+        raise RuntimeError("GEE_TZ_ASSET is unset — see scripts/build_tz_asset.py")
 
     bronze_dir = resolve_bronze_dir(data_root)
     manifest = Manifest.for_bronze_dir(bronze_dir)
@@ -67,7 +70,7 @@ def _download(
         variable,
         year,
         extent,
-        timezone,
+        tz_asset=tz_asset,
         manifest=manifest,
         bronze_dir=bronze_dir,
         chunk_days=int(chunk_days),
@@ -87,7 +90,6 @@ with DAG(
         "start_year": 1995,
         "end_year": 1995,
         "variables": ["tmax", "tmin", "precip", "srad", "wind_u", "wind_v", "tdew"],
-        "timezone": "UTC-03:00",
         "chunk_days": 30,   # daily bands held in RAM per encode step (Pi memory lever)
         "land_only": True,  # clip export to land (LSIB); drop masked-ocean cells
         "data_root": "",    # per-run data root override; blank = env DATA_DIR. Give each
