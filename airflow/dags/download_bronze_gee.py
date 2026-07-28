@@ -16,6 +16,7 @@ from __future__ import annotations
 import pendulum
 from airflow.models.dag import DAG
 from airflow.operators.python import PythonOperator
+from airflow.operators.trigger_dagrun import TriggerDagRunOperator
 
 GEE_POOL = "gee_pool"
 
@@ -85,6 +86,9 @@ with DAG(
     start_date=pendulum.datetime(2026, 1, 1, tz="UTC"),
     catchup=False,
     tags=["era5", "bronze", "gee"],
+    # Native rendering so `conf="{{ dag_run.conf }}"` on the transform trigger resolves to the
+    # actual dict (variables stays a list, years stay ints) instead of a stringified repr.
+    render_template_as_native_obj=True,
     params={
         "extent": [-90.0, -180.0, 90.0, 180.0],  # [S, W, N, E], snapped to 0.25°
         "start_year": 1995,
@@ -105,4 +109,17 @@ with DAG(
         python_callable=_download,
         pool=GEE_POOL,
     ).expand(op_kwargs=plan.output)
-    plan >> download
+
+    # After every (year, variable) download lands, kick transform_silver with the *same* conf
+    # (extent/years/variables/data_root) so bronze -> silver runs end-to-end in one trigger.
+    # transform_silver reads bronze from the same data_root and ignores the extra download-only
+    # keys (extent/chunk_days/land_only); params it doesn't receive keep their own defaults.
+    kick_transform = TriggerDagRunOperator(
+        task_id="kick_transform",
+        trigger_dag_id="transform_silver",
+        conf="{{ dag_run.conf }}",
+        reset_dag_run=True,       # re-runnable: replace a same-logical-date run instead of erroring
+        wait_for_completion=False,
+    )
+
+    plan >> download >> kick_transform
