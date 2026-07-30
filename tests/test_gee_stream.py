@@ -5,6 +5,8 @@ produces) and exercise ``iter_geotiff_chunks`` + ``download_variable_year`` with
 boundary monkeypatched to local files.
 """
 
+import json
+
 import numpy as np
 import pandas as pd
 import pyarrow.parquet as pq
@@ -12,7 +14,8 @@ import rasterio
 from rasterio.transform import from_origin
 
 from src.gee import download as dl
-from src.gee.export import iter_geotiff_chunks, read_daily_geotiffs
+from src.gee import metrics as met
+from src.gee.export import BlobStats, iter_geotiff_chunks, read_daily_geotiffs
 from src.grid.encode_long import encode_grid
 from src.grid.encoding import cell_code
 
@@ -110,18 +113,26 @@ def test_download_variable_year_streams_and_drops_ocean(tmp_path, monkeypatch):
     dates = ["2020-01-01", "2020-01-02", "2020-01-03"]
     _write_tiff(tiff, dates, nodata_cell=(2, 2))
 
+    # The export/wait/download triplet now lives in src.gee.metrics.run_export, so the
+    # EE/GCS boundary is patched there; tz_zones/build_daily_collection stay above it.
     monkeypatch.setattr(dl, "tz_zones", lambda *a, **k: [(-3.0, None)])
     monkeypatch.setattr(dl, "build_daily_collection", lambda *a, **k: object())
-    monkeypatch.setattr(dl, "start_export", lambda *a, **k: object())
-    monkeypatch.setattr(dl, "wait_for_task", lambda *a, **k: None)
-    monkeypatch.setattr(dl, "download_prefix", lambda *a, **k: [tiff])
+    monkeypatch.setattr(met, "start_export", lambda *a, **k: object())
+    monkeypatch.setattr(met, "wait_for_task", lambda *a, **k: None)
+    size = tiff.stat().st_size
+    monkeypatch.setattr(
+        met,
+        "download_prefix_measured",
+        lambda *a, **k: ([tiff], BlobStats(1, size, size, size)),
+    )
 
     bronze = tmp_path / "bronze"
     mani = _FakeManifest()
+    rec: dict = {}
     out = dl.download_variable_year(
         _FakeClient(), "tmax", 2020, [-35.0, -58.5, -30.0, -53.0],
         tz_asset="projects/test/assets/tz", manifest=mani, bronze_dir=bronze, b=B,
-        chunk_days=2,
+        chunk_days=2, sample="E1", metrics_out=rec,
     )
     assert out.exists()
     assert mani.is_var_year_done("tmax", 2020)
@@ -133,3 +144,19 @@ def test_download_variable_year_streams_and_drops_ocean(tmp_path, monkeypatch):
     assert not df.duplicated(["child_id", "date"]).any()
     # the masked corner cell (89.5, 0.5) is absent
     assert cell_code(89.5, 0.5) not in set(df["child_id"])
+
+    # cost record: counted (not derived) units, bytes from the fake blob, EECU honestly
+    # absent because the patched wait_for_task returns no status dict.
+    assert rec["sample"] == "E1"
+    assert (rec["bronze_rows"], rec["cells"], rec["days"]) == (24, 8, 3)
+    assert rec["n_units"] == 24 and rec["cells_exact"] is True
+    assert rec["bytes_remote"] == size and rec["n_blobs"] == 1
+    # 3x3 cells x 3 days of raster; 1 cell is masked ocean, so 24 of 27 are useful.
+    assert rec["raster_pixels"] == 27
+    assert rec["land_fraction"] == round(24 / 27, 12)
+    assert rec["eecu_hours"] is None and rec["eecu_per_unit"] is None
+    assert "record_write_error" not in rec
+
+    lines = (bronze / "_gee_metrics.jsonl").read_text().splitlines()
+    assert len(lines) == 1
+    assert json.loads(lines[0])["run_id"] == rec["run_id"]

@@ -422,7 +422,8 @@ POSTGRES_HOST=localhost DATA_DIR=.localdata uv run python your_script.py
 | Every `et0` is NULL | Grid block-size mismatch — run the `EU9K → 0XKE` check in §2 and restore the seed. |
 | `PermissionError` writing `/data/bronze/...` | Containers run as uid 50000; the host bind-mount is uid 1000. `chmod 777 .localdata` (single-user Pi). |
 | Host script can't read `.localdata/bronze/_manifest.json` | Same ownership split — the manifest is mode 0600 uid 50000. Read it from inside a container. |
-| `PermissionError` on the GEE service-account key | `chmod o+r` the key file, or chown it to 50000. |
+| `PermissionError` on the GEE service-account key | Containers run **uid 50000, gid 0**, so the key must be group-readable by root — **not** world-readable. `sudo chgrp 0 <key> && chmod 640 <key>`. Avoid `chmod o+r`: it exposes the private key to every local user, and `chmod 600` locks the container out (the failure mode this row exists for). |
+| `Temporary failure in name resolution` inside a task (CDS/GEE/GCS unreachable, host is fine) | The stack came up **before** the network did, so Docker baked an empty upstream into its embedded resolver. Confirm with `docker exec <scheduler> cat /etc/resolv.conf` — `NO EXTERNAL NAMESERVERS DEFINED` is the tell. Fix: `docker compose restart` once the host resolves (`getent hosts oauth2.googleapis.com`). Recurs after any boot where Wi-Fi association is slow; a fixed `dns:` entry in `docker-compose.yml` prevents it. |
 | DAG re-runs with the *old* config | **Clear** replays a run with its original conf. Use **Trigger DAG w/ config** for new params. |
 | A backfill is running away | `docker compose restart airflow-scheduler` kills in-flight LocalExecutor subprocesses. Submitted GEE exports continue server-side regardless. |
 | `airflow dags test` "passes" but nothing ran | It does not execute `.expand()` dynamically-mapped tasks. Use `airflow dags trigger` plus a running scheduler. |

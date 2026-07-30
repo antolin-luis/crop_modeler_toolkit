@@ -98,8 +98,16 @@ Use the *combined-with-oceans* boundary set so zones tile the globe with no coas
   ocean) → append to a `ParquetWriter` (`.tmp` then atomic `os.replace`) → mark manifest. A
   full LatAm year never lives in RAM (the Pi-OOM fix). Bronze row order is unspecified (the
   streamed write can't globally sort; silver upserts on the PK regardless).
+- `src/gee/metrics.py` — per-run cost accounting: `RunMetrics` (EECU, bytes egressed,
+  wall-clock, units of work), the append-only `_gee_metrics.jsonl` record store, and
+  `run_export` — the timed `start_export → wait_for_task → download_prefix_measured`
+  triplet the bronze path and the cost probes both go through. Schema:
+  `docs/cost_model_climate_context.md` §4.1.
 - `airflow/dags/download_bronze_gee.py` — DAG mirroring `download_bronze`; tasks bound to
-  the `gee_pool`.
+  the `gee_pool`. Takes a `sample` param (calibration label), logs a one-line cost summary
+  per mapped task and returns it as a dict XCom.
+- `scripts/gee_cost_probe.py` — maintainer one-off: measure a GFS or CHIRPS export through
+  the same instrumented path, writing no bronze/silver (cost-model samples E2/E3).
 
 ### Reused (not reimplemented)
 - `src/grid/encode_long.encode_grid` — the raster→long step, shared with the CDS netCDF
@@ -137,10 +145,15 @@ Use the *combined-with-oceans* boundary set so zones tile the globe with no coas
 4. **Live auth smoke:**
    `uv run python -c "import ee, src.gee.client as c; c.GEEClient(); print(ee.Number(1).getInfo())"` → `1`.
 5. **Calibration run (the key cost step):** trigger `download_bronze_gee` for **1 year ×
-   Uruguay × all 7 variables**. Confirm `bronze/<var>/<var>_<year>.parquet` exists, row
-   count == cells × days, values finite, a `child_id` decodes (`code_to_latlon`) to the
-   expected cell, and the product is genuinely daily. **Record the actual EECU-hours** from
-   the EE task list, then extrapolate the full LatAm / multi-decade cost before scaling.
+   Uruguay × all 7 variables**, passing `"sample":"E1"` and a dedicated `"data_root"`
+   (the manifest is keyed `variable:year` with no extent, so without a fresh root a re-run
+   silently no-ops). Confirm `bronze/<var>/<var>_<year>.parquet` exists, row count ==
+   cells × days, values finite, a `child_id` decodes (`code_to_latlon`) to the expected
+   cell, and the product is genuinely daily. Then read `<data_root>/bronze/_gee_metrics.jsonl`
+   — seven records, one per variable — for EECU-hours, **bytes egressed**, and the real
+   GeoTIFF compression ratio, and extrapolate the full LatAm / multi-decade cost before
+   scaling. `eecu_hours: null` means EE did not report it; look the `task_id` up on the EE
+   task list. Full protocol: `docs/cost_model_climate_context.md` §9.1.
 6. **Cross-backend parity:** for one small `(variable, year)` fetched by *both* CDS and GEE,
    confirm the same `child_id` set and `date` coverage (values differ only by each service's
    own aggregation — a sanity check, not bit-equality).
