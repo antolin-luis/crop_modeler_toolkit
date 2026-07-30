@@ -21,19 +21,16 @@ from __future__ import annotations
 
 import os
 import tempfile
+import time
 from pathlib import Path
 
 import pyarrow as pa
 import pyarrow.parquet as pq
 
 from src.gee.daily import build_daily_collection
-from src.gee.export import (
-    download_prefix,
-    iter_geotiff_chunks,
-    start_export,
-    tz_zones,
-    wait_for_task,
-)
+from src.gee.export import iter_geotiff_chunks, tz_zones
+from src.gee.metrics import RunMetrics, append_record, metrics_path, run_export
+from src.gee.variables import COLLECTION
 from src.grid.encode_long import DEFAULT_BLOCK_SIZE_B, encode_grid
 
 
@@ -49,6 +46,8 @@ def download_variable_year(
     b: int = DEFAULT_BLOCK_SIZE_B,
     chunk_days: int = 30,
     land_only: bool = True,
+    sample: str | None = None,
+    metrics_out: dict | None = None,
 ) -> Path:
     """Download one ``(variable, year)`` to ``bronze/<var>/<var>_<year>.parquet``.
 
@@ -60,53 +59,103 @@ def download_variable_year(
     encode step; ``land_only`` clips the export to land (masked ocean cells are dropped).
     Bronze row order is unspecified — the streamed write can't globally sort, and silver
     upserts on ``(parent_id, child_id, date)`` regardless.
+
+    Every run appends one cost record to ``bronze_dir/_gee_metrics.jsonl`` (EECU, bytes
+    egressed, wall-clock, units of work — see ``src/gee/metrics.py``); ``sample`` labels it
+    with the calibration sample id it feeds, and ``metrics_out``, if given, receives the
+    same record for the caller to log or push to XCom. A manifest hit returns early and
+    records nothing, because nothing was measured.
     """
     out_dir = Path(bronze_dir) / variable
     out_path = out_dir / f"{variable}_{year}.parquet"
     if manifest.is_var_year_done(variable, year) and out_path.exists():
         return out_path
 
-    zones = tz_zones(extent, tz_asset)
-    daily_col = build_daily_collection(variable, year, zones=zones)
-
     bucket = client.require_bucket()
     name_prefix = f"{client.gcs_prefix}/{variable}_{year}"
-    task = start_export(
-        daily_col,
-        extent,
-        bucket=bucket,
+    m = RunMetrics(
+        kind="bronze_var_year",
+        dataset=COLLECTION,
         name_prefix=name_prefix,
-        description=f"bronze_{variable}_{year}",
+        extent=extent,
+        variable=variable,
+        year=year,
+        sample=sample,
         land_only=land_only,
+        b=b,
+        chunk_days=chunk_days,
+        gee_project=getattr(client, "project", None),
     )
-    wait_for_task(task)
+    try:
+        zones = tz_zones(extent, tz_asset)
+        daily_col = build_daily_collection(variable, year, zones=zones)
 
-    out_dir.mkdir(parents=True, exist_ok=True)
-    tmp_path = out_path.with_name(out_path.name + ".tmp")
-    writer = None
-    with tempfile.TemporaryDirectory() as td:
-        paths = download_prefix(bucket, name_prefix, td)
-        try:
-            for values, lat, lon, times in iter_geotiff_chunks(
-                paths, chunk_days=chunk_days
-            ):
-                frame = encode_grid(values, lat, lon, times, source=name_prefix, b=b)
-                frame = frame.dropna(subset=["value"]).reset_index(drop=True)
-                if frame.empty:
-                    continue
-                table = pa.Table.from_pandas(frame, preserve_index=False)
-                if writer is None:
-                    writer = pq.ParquetWriter(tmp_path, table.schema)
-                writer.write_table(table)
-        finally:
-            if writer is not None:
-                writer.close()
+        out_dir.mkdir(parents=True, exist_ok=True)
+        tmp_path = out_path.with_name(out_path.name + ".tmp")
+        writer = None
+        with tempfile.TemporaryDirectory() as td:
+            paths = run_export(
+                daily_col,
+                extent,
+                bucket=bucket,
+                name_prefix=name_prefix,
+                description=f"bronze_{variable}_{year}",
+                dest_dir=td,
+                metrics=m,
+                land_only=land_only,
+            )
+            t_encode = time.monotonic()
+            try:
+                for values, lat, lon, times in iter_geotiff_chunks(
+                    paths, chunk_days=chunk_days
+                ):
+                    # Count pixels before the ocean drop: those bytes were egressed too,
+                    # and they are the honest denominator for compression.
+                    m.note_raster_chunk(values.size)
+                    frame = encode_grid(values, lat, lon, times, source=name_prefix, b=b)
+                    frame = frame.dropna(subset=["value"]).reset_index(drop=True)
+                    if frame.empty:
+                        continue
+                    m.note_encode_chunk(frame)
+                    table = pa.Table.from_pandas(frame, preserve_index=False)
+                    if writer is None:
+                        writer = pq.ParquetWriter(tmp_path, table.schema)
+                    writer.write_table(table)
+            finally:
+                if writer is not None:
+                    writer.close()
 
-    if writer is None:
-        tmp_path.unlink(missing_ok=True)
-        raise RuntimeError(
-            f"{name_prefix}: export produced no land cells — check extent/land_only"
-        )
-    os.replace(tmp_path, out_path)
-    manifest.mark_var_year_done(variable, year)
-    return out_path
+        if writer is None:
+            tmp_path.unlink(missing_ok=True)
+            raise RuntimeError(
+                f"{name_prefix}: export produced no land cells — check extent/land_only"
+            )
+        os.replace(tmp_path, out_path)
+        m.note_encode_done(seconds=time.monotonic() - t_encode, parquet_path=out_path)
+        manifest.mark_var_year_done(variable, year)
+        return out_path
+    except BaseException as exc:  # noqa: BLE001 — recorded, then re-raised untouched
+        # A failed run still carries task_id and t_export_s, which is exactly what you
+        # want when the failure *is* a quota event.
+        m.note_error(exc)
+        raise
+    finally:
+        _emit_metrics(m, bronze_dir, metrics_out)
+
+
+def _emit_metrics(m: RunMetrics, bronze_dir: str | Path, metrics_out: dict | None) -> None:
+    """Write the cost record. Must never turn a landed Parquet into a failed task."""
+    try:
+        record = m.to_record()
+    except Exception as exc:  # pragma: no cover — accumulator is total by construction
+        if metrics_out is not None:
+            metrics_out["record_write_error"] = f"{type(exc).__name__}: {exc}"
+        return
+    if metrics_out is not None:
+        metrics_out.update(record)
+    try:
+        append_record(metrics_path(bronze_dir), record)
+    except Exception as exc:
+        # src/ has no logger by convention; surface it via the DAG's XCom instead.
+        if metrics_out is not None:
+            metrics_out["record_write_error"] = f"{type(exc).__name__}: {exc}"

@@ -28,6 +28,7 @@ def _plan(**context) -> list[dict]:
     chunk_days = int(params["chunk_days"])
     land_only = bool(params["land_only"])
     data_root = params.get("data_root") or None
+    sample = params.get("sample") or None
     years = range(int(params["start_year"]), int(params["end_year"]) + 1)
     return [
         {
@@ -37,6 +38,7 @@ def _plan(**context) -> list[dict]:
             "chunk_days": chunk_days,
             "land_only": land_only,
             "data_root": data_root,
+            "sample": sample,
         }
         for year in years
         for variable in params["variables"]
@@ -50,9 +52,12 @@ def _download(
     chunk_days: int,
     land_only: bool,
     data_root: str | None = None,
-) -> str:
+    sample: str | None = None,
+) -> dict:
     # No timezone param: the per-cell local-day offset comes from the tz-polygon asset,
     # derived per UTC offset present in the extent (src/gee/export.tz_zones). §5.3.
+    import logging
+
     from src.config import load_config, resolve_bronze_dir
     from src.gee.client import GEEClient
     from src.gee.download import download_variable_year
@@ -60,12 +65,15 @@ def _download(
     # Manifest is shared with the CDS backend: a (variable, year) done by either is done.
     from src.cds.manifest import Manifest
 
+    log = logging.getLogger(__name__)
+
     tz_asset = load_config().gee.tz_asset
     if not tz_asset:
         raise RuntimeError("GEE_TZ_ASSET is unset — see scripts/build_tz_asset.py")
 
     bronze_dir = resolve_bronze_dir(data_root)
     manifest = Manifest.for_bronze_dir(bronze_dir)
+    rec: dict = {}
     path = download_variable_year(
         GEEClient(),
         variable,
@@ -76,8 +84,41 @@ def _download(
         bronze_dir=bronze_dir,
         chunk_days=int(chunk_days),
         land_only=bool(land_only),
+        sample=sample,
+        metrics_out=rec,
     )
-    return str(path)
+    # Cost accounting (docs/cost_model_climate_context.md §3). `rec` is empty on a
+    # manifest hit — nothing ran, so nothing was measured. eecu_hours may legitimately be
+    # None: EE does not always report it, and the task_id in the JSONL is the handle for
+    # reading it off the EE task list by hand.
+    log.info(
+        "%s %s: %s rows, %s cells x %s days, %s EECU-h, %s bytes in %s blob(s), "
+        "export %ss / download %ss / encode %ss",
+        variable, year,
+        rec.get("bronze_rows"), rec.get("cells"), rec.get("days"),
+        rec.get("eecu_hours"), rec.get("bytes_remote"), rec.get("n_blobs"),
+        rec.get("t_export_s"), rec.get("t_download_s"), rec.get("t_encode_s"),
+    )
+    if rec.get("record_write_error"):
+        log.warning("cost record not persisted: %s", rec["record_write_error"])
+    return {
+        "variable": variable,
+        "year": year,
+        "path": str(path),
+        "sample": sample or "",
+        "bronze_rows": rec.get("bronze_rows"),
+        "cells": rec.get("cells"),
+        "days": rec.get("days"),
+        "n_units": rec.get("n_units"),
+        "eecu_hours": rec.get("eecu_hours"),
+        "bytes_remote": rec.get("bytes_remote"),
+        "n_blobs": rec.get("n_blobs"),
+        "compression_ratio": rec.get("compression_ratio"),
+        "t_export_s": rec.get("t_export_s"),
+        "t_download_s": rec.get("t_download_s"),
+        "t_encode_s": rec.get("t_encode_s"),
+        "task_id": rec.get("task_id"),
+    }
 
 
 with DAG(
@@ -98,6 +139,8 @@ with DAG(
         "land_only": True,  # clip export to land (LSIB); drop masked-ocean cells
         "data_root": "",    # per-run data root override; blank = env DATA_DIR. Give each
                             # region its own root (e.g. /data/hn) to avoid manifest clashes.
+        "sample": "",       # calibration sample id (e.g. "E1") stamped on each cost record
+                            # in <bronze>/_gee_metrics.jsonl. Blank for ordinary backfills.
     },
 ) as dag:
     plan = PythonOperator(

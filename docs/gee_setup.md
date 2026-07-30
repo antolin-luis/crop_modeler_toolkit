@@ -108,7 +108,10 @@ The backend exports each daily raster to Google Cloud Storage, then downloads it
 bucket once:
 
 ```bash
-gcloud storage buckets create gs://your-era5-bronze-export --location=US
+# Pick a region near the machine that downloads. This project's bucket is
+# southamerica-east1 (São Paulo); `--location=US` is a multi-region and only a sensible
+# default if you are in North America.
+gcloud storage buckets create gs://your-era5-bronze-export --location=southamerica-east1
 ```
 
 Set in `.env`:
@@ -123,8 +126,16 @@ GeoTIFFs don't accumulate (the bronze Parquet on your SSD is the real artifact �
 are transient):
 
 ```bash
-printf '{"rule":[{"action":{"type":"Delete"},"condition":{"age":3}}]}' > /tmp/lc.json
+printf '{"rule":[{"action":{"type":"Delete"},"condition":{"age":3}},{"action":{"type":"AbortIncompleteMultipartUpload"},"condition":{"age":3}}]}' > /tmp/lc.json
 gcloud storage buckets update gs://your-era5-bronze-export --lifecycle-file=/tmp/lc.json
+```
+
+**Verify it took** — the two actions are not interchangeable, and applying only the second
+silently leaves every completed object in place forever:
+
+```bash
+gcloud storage buckets describe gs://your-era5-bronze-export --format="yaml(lifecycle_config)"
+# must show action type Delete, not only AbortIncompleteMultipartUpload
 ```
 
 ## 6. Timezone polygon asset (required before any GEE download)
@@ -189,18 +200,38 @@ All are optional for CDS-only users; `GEEClient` validates the ones it needs at 
 
 ## 8. Quota, cost, and sizing a real backfill
 
-- **Read your usage:** the EE task list (<https://code.earthengine.google.com/tasks>) and
-  the project's EECU quota page show EECU-hours consumed per export.
+- **Read your usage:** every run now self-reports. One JSON record per `(variable, year)`
+  lands in `<bronze_dir>/_gee_metrics.jsonl` with `eecu_hours`, `bytes_remote`, wall-clock
+  and `n_units` — see `docs/cost_model_climate_context.md` §4.1 for the schema and
+  `src/gee/metrics.py` for the code. The EE task list
+  (<https://code.earthengine.google.com/tasks>) and the project's EECU quota page remain
+  the fallback: EE does not always report `batch_eecu_usage_seconds`, in which case
+  `eecu_hours` is `null` (never a fake `0.0`) and the record's `task_id` is the handle for
+  looking it up by hand.
 - **Calibrate before scaling.** Run **one year × one country × all variables** first
   (see `docs/step3b_bronze_download_gee.md` → Verification), read the actual EECU-hours,
   and extrapolate linearly (cost scales ~ cells × days). Don't trust a-priori estimates.
-- **Latin America, full record (rough):** ~50–65k land cells × ~16,800 days × 7 variables
-  is plausibly a few hundred to ~1–2k EECU-hours total. As a student that is **free**, but
-  it likely exceeds the 150/month Community quota — either:
-  - upgrade to the **Contributor tier** (1,000/month, still free), and/or
-  - **split the year range across runs/months** (the DAG's `start_year`/`end_year` make
-    this trivial), staying under the monthly quota.
+- **⚠ EECU is not the only meter.** Every byte exported to GCS and pulled to the Pi is
+  billed network egress, which the §5 lifecycle rule does not touch — it bounds *storage*
+  only. Egress scales linearly with extent and is invisible at single-country scale;
+  `bytes_remote` in the metrics JSONL is what makes it visible before a continental
+  backfill. Set a GCP budget alert. See `docs/cost_model_climate_context.md` §2.
+- **Measured, 2026-07-30:** the complete **Honduras** backfill (341 land cells, 1950–2026,
+  7 variables — 539 export tasks) cost **17.41 EECU-h** and **364 MB** of egress (≈$0.04).
+  ⚠ Do not scale that per-cell rate up naively: those tasks ranged 0.0170–0.0516 EECU-h for
+  *identical* work, a 3× spread, meaning at country scale you are measuring per-task
+  overhead rather than compute.
+- **Latin America, full record:** ~50–65k land cells × ~16,800 days × 7 variables projects
+  to **~1,840 EECU-h** by linear extrapolation from Honduras — but per the caveat above,
+  treat that as an **upper bound**. Egress at the same scale is **measured** at 17.1 GB
+  (≈$2). With the **Contributor tier (1,000 EECU-h/month, already active on this project)**
+  that is ~2 months of quota, so **split the year range across runs/months** (the DAG's
+  `start_year`/`end_year` make this trivial). See `docs/cost_model_climate_context.md` §6.
 - Commercial-equivalent value, for reference only: ~$0.40 × EECU-hours (Batch rate).
+- **Mine history before you measure.** `ee.data.listOperations()` reports
+  `batchEecuUsageSeconds` per past task, and GCS object sizes give egress — together they
+  can answer the sizing question for free. EE retains operations only ~1 week, so read them
+  soon after a backfill.
 
 ## See also
 - `docs/step3b_bronze_download_gee.md` — how the backend is built and how to run it.

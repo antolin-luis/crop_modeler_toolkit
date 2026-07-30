@@ -15,6 +15,7 @@ The compute lives server-side; this module triggers it and retrieves the result:
 from __future__ import annotations
 
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
@@ -150,11 +151,30 @@ def wait_for_task(
         sleep(poll_interval)
 
 
-def download_prefix(bucket: str, name_prefix: str, dest_dir: str | Path) -> list[Path]:
-    """Download every GCS object under ``name_prefix`` (the export's shard(s)) locally.
+@dataclass(frozen=True)
+class BlobStats:
+    """Byte accounting for one export's shards (docs/cost_model_climate_context.md §3).
 
-    A region-limited single image is usually one ``.tif``; large exports tile into several
-    ``...-NNNNNNNNNN-NNNNNNNNNN.tif`` shards, all returned.
+    ``bytes_remote`` is the billed quantity — GCS meters egress on stored object size —
+    and ``bytes_local`` is the independent cross-check after download. They should be
+    equal (EE exports set no ``Content-Encoding``, so nothing is transparently
+    decompressed); a divergence would mean egress ≠ disk and is a finding, not noise.
+    """
+
+    n_blobs: int
+    bytes_remote: int
+    bytes_local: int
+    bytes_per_blob_max: int
+
+
+def download_prefix_measured(
+    bucket: str, name_prefix: str, dest_dir: str | Path
+) -> tuple[list[Path], BlobStats]:
+    """:func:`download_prefix`, plus the byte/shard accounting the cost model needs.
+
+    ``blob.size`` comes back on the list response, so this adds **zero** GCS operations.
+    Sizes are computed eagerly, because the caller's ``dest_dir`` is typically a
+    ``TemporaryDirectory`` that is gone by the time anything lazy would be read.
     """
     from google.cloud import storage  # lazy: keeps the import off the CDS-only path
 
@@ -170,12 +190,29 @@ def download_prefix(bucket: str, name_prefix: str, dest_dir: str | Path) -> list
         raise FileNotFoundError(
             f"no .tif under gs://{bucket}/{name_prefix} after a completed export"
         )
-    paths = []
+    paths, sizes, local_bytes = [], [], 0
     for blob in blobs:
         local = dest_dir / Path(blob.name).name
         blob.download_to_filename(str(local))
         paths.append(local)
-    return sorted(paths)
+        sizes.append(int(blob.size or 0))
+        local_bytes += local.stat().st_size
+    stats = BlobStats(
+        n_blobs=len(blobs),
+        bytes_remote=sum(sizes),
+        bytes_local=local_bytes,
+        bytes_per_blob_max=max(sizes),
+    )
+    return sorted(paths), stats
+
+
+def download_prefix(bucket: str, name_prefix: str, dest_dir: str | Path) -> list[Path]:
+    """Download every GCS object under ``name_prefix`` (the export's shard(s)) locally.
+
+    A region-limited single image is usually one ``.tif``; large exports tile into several
+    ``...-NNNNNNNNNN-NNNNNNNNNN.tif`` shards, all returned.
+    """
+    return download_prefix_measured(bucket, name_prefix, dest_dir)[0]
 
 
 def _band_dates(descriptions) -> list[str]:
