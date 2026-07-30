@@ -221,12 +221,13 @@ All are optional for CDS-only users; `GEEClient` validates the ones it needs at 
   ⚠ Do not scale that per-cell rate up naively: those tasks ranged 0.0170–0.0516 EECU-h for
   *identical* work, a 3× spread, meaning at country scale you are measuring per-task
   overhead rather than compute.
-- **Latin America, full record:** ~50–65k land cells × ~16,800 days × 7 variables projects
-  to **~1,840 EECU-h** by linear extrapolation from Honduras — but per the caveat above,
-  treat that as an **upper bound**. Egress at the same scale is **measured** at 17.1 GB
-  (≈$2). With the **Contributor tier (1,000 EECU-h/month, already active on this project)**
-  that is ~2 months of quota, so **split the year range across runs/months** (the DAG's
-  `start_year`/`end_year` make this trivial). See `docs/cost_model_climate_context.md` §6.
+- **Latin America, full record — measured:** **30,303** LSIB-clipped land cells; one year of
+  all 7 variables = **2.45 EECU-h**, so the full 46-year backfill is **~113 EECU-h** and
+  **17.1 GB** of egress (≈$2). That is ~11% of one month on the **Contributor tier
+  (1,000 EECU-h/month, already active here)** — and it fit even the old 150/month Community
+  quota. **No year-splitting is needed for quota reasons.** At-scale rate is 3.16e-8
+  EECU-h/cell-day, **8.3× better than Honduras's 2.61e-7** — fixed per-task cost amortizes,
+  so prefer fewer, larger jobs. See `docs/cost_model_climate_context.md` §6.
 - Commercial-equivalent value, for reference only: ~$0.40 × EECU-hours (Batch rate).
 - **Mine history before you measure.** `ee.data.listOperations()` reports
   `batchEecuUsageSeconds` per past task, and GCS object sizes give egress — together they

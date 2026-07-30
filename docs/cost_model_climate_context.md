@@ -55,7 +55,7 @@ Two independent measurements against real artifacts confirm it, both obtained at
 
 So the entire continental 46-year backfill costs about **two dollars** of egress, and the Honduras archive that already exists cost four cents. The `$20` budget alert sits ~10× above the largest job in the plan.
 
-**One caveat that matters more than the totals:** bytes per useful cell-day is **not extent-invariant**. Honduras measures 5.46 B/cell-day; LatAm implies ~2.1 B/cell-day (at ~60k land cells). A small bbox pays fixed per-shard overhead spread over few useful values, and its land fraction is worse. **Do not extrapolate a small extent's per-unit rate to a large one** — that is the error the corrected model must not repeat in the other direction.
+**Bytes per useful cell-day is roughly extent-stable:** Honduras 5.46 B/cell-day, LatAm **4.77** B/cell-day (371 MB / (30,303 cells × 366 d × 7 vars)) — 13% apart. *(An earlier revision of this section claimed ~2.1 B/cell-day for LatAm and concluded the rate varied strongly with extent. That used a guessed ~60k land cells; the measured LSIB-clipped count is **30,303**.)* Egress therefore does extrapolate linearly. **EECU does not** — see §6.
 
 ### Consequences
 
@@ -214,11 +214,15 @@ Partially filled from E0 (§9.2). **Honduras is measured at 341 land cells**, no
 | Honduras only | **341** (measured) | 1× | **~10 EECU-h** (measured: 17.41 for 77 yr) | **~0.22 GB** (measured: 364 MB for 77 yr) | **$0.03** |
 | Central America (7) | ~4–6k (est.) | ~15× | *E1 measures this* | ~1–2 GB (est.) | ~$0.2 |
 | Mexico + CentAm | ~12–15k (est.) | ~40× | *unmeasured* | ~4–5 GB (est.) | ~$0.5 |
-| Latin America | ~50–65k | ~175× | **~1,840 EECU-h if linear — see warning** | **17.1 GB** (measured) | **$2.05** |
+| Latin America | **30,303** (measured, LSIB-clipped) | ~89× | **~113 EECU-h** (measured: 2.45/yr × 46) | **17.1 GB** (measured) | **$2.05** |
 
-**The egress column is settled; the EECU column is not.** The LatAm egress figure is a direct measurement (`bench-latam`, ×46 years), not an extrapolation. The LatAm EECU figure *is* an extrapolation — `2.61e-7 EECU-h/cell-day` from Honduras × `7.06e9` cell-days — and it is the least trustworthy number in this document, for the reason in §4: at Honduras scale the meter reads fixed overhead, with a 3× spread across identical tasks. Treat ~1,840 EECU-h (≈2 months of quota) as an **upper bound**, because overhead-dominated samples over-state the marginal rate. E1 replaces it.
+**Both columns are now measured.** The LatAm EECU figure comes from the `bench-latam` calibration (2026-06-27): **2.45 EECU-h for one LatAm-year of all 7 variables over 30,303 land cells**, recorded in `docs/runbook.md` and confirmed by the project's own history. ×46 years → **~113 EECU-h ≈ 11% of one month's Contributor quota.** No year-splitting is needed for quota reasons.
 
-**Read the multiplier column before the estimates.** LatAm is ~175× Honduras, not ~400×.
+**The overhead effect, now quantified.** `eecu_per_unit` is **3.16e-8** EECU-h/cell-day at LatAm scale vs **2.61e-7** at Honduras scale — small extents are **8.3× worse per unit**, because fixed per-task cost is amortized over far fewer values. This is why extrapolating from a country-sized sample overstates the total:
+
+> ⚠ **Correction, 2026-07-30.** An earlier revision of this table projected **~1,840 EECU-h** for LatAm by scaling Honduras's rate up 175×, and concluded the backfill needed ~2 months of quota. That is **~16× too high**. It was written before the pre-existing 2.45 EECU-h/LatAm-year measurement was rediscovered, and it assumed ~50–65k land cells where the measured count is 30,303. The lesson is procedural, not arithmetic: **check `docs/runbook.md` and prior calibration notes before extrapolating** — the number already existed.
+
+**Read the multiplier column before the estimates.** LatAm is ~89× Honduras — not ~400× as originally guessed, and not the ~175× of the interim correction.
 
 ---
 
@@ -262,8 +266,8 @@ What each measurement would actually change — stated in advance, so the number
 |---|---|
 | ~~E1 egress for LatAm ERA5 > ~$100~~ | ✅ **Resolved by E0: $2.05 total.** Gate cannot fire; export path stays as-is |
 | ~~E1 compression ≥ 4×~~ | ✅ **Superseded.** Egress is settled in absolute terms, so the ratio no longer drives a decision |
-| **E1 `eecu_per_unit` ≥ E0-HN's 2.61e-7** | Overhead is *not* dominating after all — LatAm really is ~1,840 EECU-h ≈ 2 months of quota. Split the backfill by year range across months |
-| **E1 `eecu_per_unit` still falling at CentAm scale** | Sample once more at Mexico + CentAm before projecting; the curve has not flattened |
+| ~~E1 `eecu_per_unit` vs Honduras~~ | ✅ **Resolved without E1**: the `bench-latam` calibration already measured 3.16e-8 at continental scale (8.3× better than Honduras). LatAm ≈ 113 EECU-h, comfortably inside one month. E1 is now confirmation, not discovery |
+| **E1 `eecu_per_unit` materially above 3.16e-8** | The continental figure does not hold at intermediate extents — re-examine before scheduling a full backfill |
 | E2 GFS > ~25 EECU-h/day (≈750/month) | Reduce GFS variables or drop to once-daily. **Contributor tier is already in use — there is no tier left to upgrade to** |
 | E3 CHIRPS full history > ~500 EECU-h | Keep the 10-year default; make full backfill a documented opt-in with its own warning |
 | C2 hindcast > ~24 CDS requests or heavy queueing | Split across two months; it is a one-off, so delay is free |
@@ -374,7 +378,7 @@ DELETE FROM wth_base
 | Sample | Date run | Extent | `N_s` (cell-days) | `E_s` (EECU-h) | `B_s` (GB) | Cost | Notes |
 |---|---|---|---|---|---|---|---|
 | E0-HN | 2026-07-23/24 | Honduras, 341 land cells, 1950–2026 × 7 vars (539 var-years) | 66,735,746 | **17.41** | 0.364 | $0.044 | 5.46 B/cell-day; **2.61e-7 EECU-h/cell-day**; per-task EECU 0.0170–0.0516 (**3× spread at constant work** → overhead-dominated) |
-| E0-LatAm | 2026-06-27 | LatAm, 1 yr × 7 vars | — | *not retained by `listOperations`* | 0.371 | $0.045 | ×46 yr → 17.1 GB / $2.05. Implies ~2.1 B/cell-day at ~60k cells vs Honduras's 5.46 → **per-unit rate is not extent-invariant** |
+| E0-LatAm | 2026-06-27 | LatAm, **30,303 land cells**, 1 yr × 7 vars | 77,636,286 | **2.45** (from `docs/runbook.md`; no longer in `listOperations`) | 0.371 | $0.045 | ×46 yr → **113 EECU-h**, 17.1 GB, $2.05. `eecu_per_unit` **3.16e-8**, `bytes_per_unit` **4.77** — vs Honduras 2.61e-7 / 5.46 |
 
 `R_s`/`D_s` were not captured for E0 (silver holds Uruguay, not the `hn` root). They are not on the critical path: both scale with cells × days and neither has ever been the constraint.
 
@@ -406,7 +410,7 @@ Levers worth evaluating before retrying E1 (**not yet investigated — deferred 
 - **`int16` with a scale factor** — dropped in §2 as a *cost* measure, but it also cuts bytes moved and may cut export time.
 - **Check whether the 4-zone mosaic is the dominant term** by running Brazil with a single-offset extent of similar cell count.
 
-Until this is resolved, `eecu_per_unit` at scale stays unmeasured and every LatAm EECU figure in this document remains an upper bound (§6).
+**This no longer blocks the cost model.** `eecu_per_unit` at continental scale was already measured by `bench-latam` (3.16e-8 → ~113 EECU-h for the full backfill, §6), so E1 would only confirm the intermediate shape of the curve. What remains is an engineering problem: a continental backfill cannot be *run* at acceptable wall-clock until export granularity is fixed, regardless of what it would cost.
 | E2 | | | | | | | | | |
 | E3 | | | | | | | | | |
 | C1 | | | | | | | | | |
@@ -422,14 +426,14 @@ Until this is resolved, `eecu_per_unit` at scale stays unmeasured and every LatA
 
 Honest list of what this model cannot yet predict:
 
-1. ✅ **CLOSED — GeoTIFF compression.** Measured indirectly at 5.46 B/cell-day (Honduras) and ~2.1 B/cell-day (LatAm). The instrumentation now separates true `compression_ratio` (against *raster* pixels) from `land_fraction`, because the first version conflated them and made a sea-heavy bbox read as `0.80×`.
+1. ✅ **CLOSED — GeoTIFF compression.** Measured indirectly at 5.46 B/cell-day (Honduras) and 4.77 B/cell-day (LatAm). The instrumentation now separates true `compression_ratio` (against *raster* pixels) from `land_fraction`, because the first version conflated them and made a sea-heavy bbox read as `0.80×`.
 2. ✅ **MOOT — EE direct-download vs GCS egress billing.** Only mattered as a mitigation for a $1,700 bill that turned out to be $2.
 3. ✅ **MOOT — free-tier egress allowance.** At 17 GB continent-wide the answer changes nothing.
 4. **EECU accounting for GFS** — a forecast collection with more timesteps per day than ERA5 may reduce differently than the linear model assumes. → E2. **Still open.**
 5. **Autovacuum behaviour on a Pi** under daily 10⁷-row TRUNCATE+COPY cycles. → D1. **Still open** (deferred).
 6. **IRI Data Library rate limits** for the plume — no published figure known; treat as best-effort.
 7. ✅ **CLOSED — Contributor tier.** Already granted: 1,000 EECU-h/month. This also removes it as a *remedy*, since it can no longer be traded for headroom.
-8. **⚠ NEW — where the EECU curve flattens.** The dominant open unknown. Honduras-scale tasks show a 3× EECU spread at constant workload, so the per-cell-day rate there is overhead, not compute. Without a mid-scale sample, every LatAm EECU projection in this document is an upper bound of unknown tightness. → E1.
+8. ✅ **CLOSED — where the EECU curve flattens.** The `bench-latam` calibration measures 3.16e-8 EECU-h/cell-day at continental scale vs 2.61e-7 at Honduras scale (8.3× amortization), so LatAm is ~113 EECU-h. Only the *intermediate* shape of the curve is unsampled, and nothing depends on it. Briefly the "dominant open unknown" in this document because a pre-existing measurement was overlooked.
 9. **⚠ NEW — large-extent export wall-clock.** A Brazil-sized variable-year does not complete in a workable time as a single 366-band export task (§9.3). This blocks E1 and, by extension, any continental backfill — independently of cost, which is settled. Being addressed in a dedicated session on efficient large-extent downloads.
 10. **⚠ NEW — Pi hardware stability.** Three unexplained hard freezes in two days (2026-07-29 10:30, 2026-07-30 03:03, 2026-07-30 14:28), no OOM / thermal / under-voltage / PCIe trace in any journal. Unattended multi-hour runs are unreliable until this is understood. Bronze is idempotent per `(variable, year)`, so a freeze costs at most one variable-year on resume — but a *hard* freeze writes no metrics record at all, so interrupted samples must be re-run into a fresh `data_root`.
 
@@ -441,7 +445,8 @@ Rewritten 2026-07-30, after E0 replaced the estimates with measurements.
 
 - **Nothing here costs meaningful money.** The full 46-year Latin America ERA5 backfill egresses **17.1 GB ≈ $2.05**. The complete Honduras archive that already exists cost **$0.044**. EECU is quota-limited, not billed; CDS and every HTTP source are free; the Pi is sunk cost.
 - **§2's $1,700 egress risk was a unit error** (28 GB written as 28 TB), and the mitigations it motivated — `int16`, `toDrive`, direct-download — are all withdrawn. This document's most valuable output so far is the deletion of its own headline finding.
-- **The one genuinely open question is where the EECU curve flattens.** Honduras-scale tasks vary 3× at constant workload, so they measure overhead, not compute. Every LatAm EECU projection here (~1,840 EECU-h ≈ 2 months of quota) is an upper bound until E1 runs at Central America scale.
+- **EECU is settled too.** The LatAm 46-year backfill is **~113 EECU-h** — 11% of one month's Contributor quota — measured, not extrapolated. Small extents are 8.3× worse per unit because fixed per-task cost dominates; that is a reason to prefer *fewer, larger* jobs, not a constraint on the total.
+- **The one genuinely open item is export wall-clock at scale** (§9.3), which is a throughput problem, not a cost or quota one.
 - **The one real scheduling exposure remains GFS's recurring monthly EECU**, because unlike a backfill it cannot be split across months. Quota is 1,000 EECU-h/month and Contributor tier is already in use, so there is no upgrade left as a remedy. → E2.
 - **Method note worth carrying forward:** E0 cost nothing. Object metadata, Parquet row counts, and `ee.data.listOperations()` answered at country and continental scale what was scheduled as an hour of paid runs. On any project with history, mine it before you measure it — but mine it *early*, since EE retains operations only about a week.
 
