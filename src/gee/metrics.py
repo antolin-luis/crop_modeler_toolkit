@@ -38,9 +38,16 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterator
 
-from src.gee.export import download_prefix_measured, start_export, wait_for_task
+from src.gee.export import (
+    download_prefix_measured,
+    start_export,
+    task_attempt,
+    wait_for_task,
+)
 
-SCHEMA_VERSION = 1
+# v2 adds the chunking fields: chunk_id, parents, land_parents, n_zones, parallel,
+# attempts, max_attempts. A v1 reader sees them as absent, not wrong.
+SCHEMA_VERSION = 2
 _FILENAME = "_gee_metrics.jsonl"
 
 # float32 on the canonical grid — the denominator of the GeoTIFF compression ratio, the
@@ -147,6 +154,15 @@ class RunMetrics:
     gee_project: str | None = None
     track_cells: bool = True
 
+    # Chunking (src/gee/chunks.py). All None on a whole-extent run, which is what makes a
+    # chunked JSONL comparable to the E0/E1 rows already recorded at v1.
+    chunk_id: str | None = None
+    parents: int | None = None  # parents in the chunk box
+    land_parents: int | None = None  # of those, the ones holding land (from the grid)
+    n_zones: int | None = None  # timezone zones mosaicked per band — the §9.3 suspect
+    parallel: int | None = None  # concurrent exports in flight during this run
+    max_attempts: int | None = None
+
     run_id: str = field(default_factory=lambda: uuid.uuid4().hex)
     started_at: str = field(
         default_factory=lambda: datetime.now(timezone.utc).isoformat()
@@ -156,6 +172,7 @@ class RunMetrics:
     task_id: str | None = None
     task_state: str | None = None
     eecu_seconds: float | None = None
+    attempts: int = 1  # highest EE attempt seen across polls
     _status: dict | None = field(default=None, repr=False)
 
     n_blobs: int | None = None
@@ -189,6 +206,19 @@ class RunMetrics:
         """
         self.task_id = getattr(task, "id", None) or self.task_id
 
+    def note_poll(self, status: dict | None) -> None:
+        """Fold in one poll of the EE status. Wired to ``wait_for_task(on_poll=...)``.
+
+        Only the attempt counter is kept, and only its maximum: a task that dies on
+        attempt 3 and is then cancelled reports ``attempt`` 3 in the status that mattered,
+        but nothing guarantees the terminal status still carries it.
+        """
+        self.attempts = max(self.attempts, task_attempt(status))
+
+    def note_zones(self, n_zones: int) -> None:
+        """How many timezone zones this export mosaics per band (``export.tz_zones``)."""
+        self.n_zones = int(n_zones)
+
     def note_export(self, *, task, status, seconds: float) -> None:
         """Record the export phase. ``task``/``status`` may be fakes or ``None``."""
         self.task_id = getattr(task, "id", None) or (
@@ -196,6 +226,7 @@ class RunMetrics:
         ) or self.task_id
         self.task_state = status.get("state") if isinstance(status, dict) else None
         self._status = status if isinstance(status, dict) else None
+        self.note_poll(self._status)
         raw = self._status.get("batch_eecu_usage_seconds") if self._status else None
         self.eecu_seconds = float(raw) if isinstance(raw, (int, float)) else None
         self.t_export_s = seconds
@@ -298,9 +329,17 @@ class RunMetrics:
             "name_prefix": self.name_prefix,
             "host": socket.gethostname(),
             "gee_project": self.gee_project,
+            # chunking (schema v2)
+            "chunk_id": self.chunk_id,
+            "parents": self.parents,
+            "land_parents": self.land_parents,
+            "n_zones": self.n_zones,
+            "parallel": self.parallel,
             # E_s
             "task_id": self.task_id,
             "task_state": self.task_state,
+            "attempts": self.attempts,
+            "max_attempts": self.max_attempts,
             "eecu_seconds": self.eecu_seconds,
             "eecu_hours": eecu_h,
             # B_s
@@ -367,6 +406,7 @@ def run_export(
     land_only: bool = True,
     poll_interval: float = 20.0,
     timeout: float = 6 * 3600.0,
+    max_attempts: int | None = None,
 ) -> list[Path]:
     """Submit, wait, fetch — each phase timed into ``metrics``. Returns local shards.
 
@@ -378,8 +418,13 @@ def run_export(
     the only thing ``start_export`` requires. Everything ERA5-specific
     (``daily.build_daily_collection``) sits *above* this call, which is what lets the GFS
     and CHIRPS cost probes measure themselves through exactly this code path.
+
+    ``max_attempts`` bounds EE's internal restarts (see ``export.wait_for_task``); the
+    attempt count reaches the record either way, because polls are folded into ``metrics``
+    as they happen rather than read off the terminal status.
     """
     t0 = time.monotonic()
+    metrics.max_attempts = max_attempts
     task = start_export(
         collection,
         extent,
@@ -390,7 +435,13 @@ def run_export(
     )
     metrics.note_task_started(task)
     try:
-        status = wait_for_task(task, poll_interval=poll_interval, timeout=timeout)
+        status = wait_for_task(
+            task,
+            poll_interval=poll_interval,
+            timeout=timeout,
+            max_attempts=max_attempts,
+            on_poll=metrics.note_poll,
+        )
     except BaseException:
         # A cancelled or failed export has usually already consumed EECU. Re-poll once so
         # the record keeps what it spent instead of reporting nulls; best-effort, because

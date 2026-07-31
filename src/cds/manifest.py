@@ -35,6 +35,10 @@ def _chunk_key(start: str, end: str) -> str:
     return f"{start}/{end}"
 
 
+def _spatial_key(chunk_id: str) -> str:
+    return f"sp:{chunk_id}"
+
+
 class Manifest:
     """On-disk record of completed downloads. Not thread-safe; one writer at a time."""
 
@@ -90,6 +94,24 @@ class Manifest:
     def mark_chunk_done(self, variable: str, year: int, start: str, end: str) -> None:
         chunks = self._entry(variable, year)["chunks"]
         key = _chunk_key(start, end)
+        if key not in chunks:
+            chunks.append(key)
+            chunks.sort()
+            self._write()
+
+    # --- spatial sub-chunks -----------------------------------------------------
+    # The GEE backend splits a variable-year by *area* as well (src/gee/chunks.py), and
+    # those parts share the ``chunks`` list with the time sub-chunks above — the ``sp:``
+    # prefix keeps the two namespaces apart. A spatial part never implies the year is
+    # done: only the caller that owns the full extent knows when every part has landed,
+    # so ``mark_var_year_done`` stays its decision.
+    def is_spatial_chunk_done(self, variable: str, year: int, chunk_id: str) -> bool:
+        entry = self._data["var_years"].get(_vy_key(variable, year))
+        return bool(entry and _spatial_key(chunk_id) in entry.get("chunks", []))
+
+    def mark_spatial_chunk_done(self, variable: str, year: int, chunk_id: str) -> None:
+        chunks = self._entry(variable, year)["chunks"]
+        key = _spatial_key(chunk_id)
         if key not in chunks:
             chunks.append(key)
             chunks.sort()

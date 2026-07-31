@@ -150,6 +150,7 @@ Fields, grouped by symbol:
 | `B_s` | `n_blobs`, `bytes_remote`, `bytes_local`, `bytes_per_blob_max` |
 | `T_s` | `t_export_s`, `t_download_s`, `t_encode_s`, `t_total_s`, `ee_queue_s`, `ee_compute_s` |
 | `N_s` | `bronze_rows`, `raster_pixels`, `cells`, `cells_exact`, `days`, `n_units` |
+| chunking (**v2**) | `chunk_id`, `parents`, `land_parents`, `n_zones`, `parallel`, `attempts`, `max_attempts` |
 | derived | `bytes_per_unit`, `eecu_per_unit`, `compression_ratio`, `land_fraction` |
 | context | `sample`, `kind`, `dataset`, `variable`, `year`, `extent`, `land_only`, `b`, `chunk_days`, `host`, `gee_project`, `run_id`, `started_at`, `finished_at`, `parquet_path`, `parquet_bytes`, `error` |
 
@@ -158,6 +159,7 @@ Three properties of the record worth knowing before reading one:
 - **`eecu_hours` is `null`, never `0.0`, when EE omits `batch_eecu_usage_seconds`.** The field is not guaranteed on every terminal state. A silent zero would corrupt `eecu_per_unit` — the number this whole exercise exists to produce — so an honest null is recorded and `task_id` is the handle for reading the value off the EE task list by hand.
 - **`bronze_rows` is not `R_s`.** Silver is wide: ~7 bronze variable-rows merge into one `wth_base` row. Using it as `rows_per_unit` inflates that rate 7×. `R_s` / `D_s` stay a Postgres query (§9).
 - **A failed run still writes a record**, carrying `task_id`, `t_export_s` and `error` — which is precisely what you want when the failure *is* a quota event.
+- **`schema_version` is `2` from 2026-07-31.** The added fields are the chunking group above; every v1 field kept its name and meaning, so a mixed JSONL reads fine and v1 rows simply lack the new keys. `attempts` defaults to `1` — the count EE implies when it never restarts a task — and is the field that separates "slow" from "dying repeatedly" (§9.3).
 - **`compression_ratio` is measured against `raster_pixels`, not land cells.** Masked ocean pixels are stored in the GeoTIFF and egressed like any other, so they belong in the compression denominator; `land_fraction` reports separately how much of the raster was useful. An earlier version divided by land-only rows and consequently reported `0.80×` for Honduras — a codec "failure" that was really just a sea-heavy bounding box. **`bytes_per_unit` is the number to extrapolate with**, and §2 records that it is not extent-invariant.
 
 The `download_bronze_gee` DAG takes a `sample` param (e.g. `"E1"`), stamps it on each record, logs a one-line summary per mapped task, and returns the same numbers as a dict XCom.
@@ -311,6 +313,26 @@ docker compose run --rm airflow-scheduler airflow dags trigger download_bronze_g
 # projection from ABOVE for a same-zone-count extent, and LatAm itself spans more zones
 # still. Treat the resulting rate as conservative, not exact.
 
+# E1a / E1b — export chunk sizing (§9.3). Runs on the HOST like the other probes, so
+# --data-root is a host path; it also reads era5_land_base_grid to skip ocean-only
+# chunks, and Postgres is published on localhost:5432 rather than the compose hostname.
+# Always --dry-run first: it prints the exact chunks and costs nothing.
+POSTGRES_HOST=localhost uv run python scripts/gee_chunk_probe.py ladder --dry-run
+POSTGRES_HOST=localhost uv run python scripts/gee_chunk_probe.py ladder \
+    --sample E1a --data-root .localdata/probe_ladder
+# --max-attempts defaults to 2: a chunk that makes EE restart twice is over the line and
+# is cancelled rather than waited out. A cancelled chunk is a RESULT, not an error — it
+# is how the ladder finds the ceiling, and its record carries attempts + task_id.
+
+# Then the concurrency sweep at whichever size won. Each level gets its own data_root
+# (.../p1, /p2, ...) because a manifest hit would otherwise skip the repeat measurement.
+POSTGRES_HOST=localhost uv run python scripts/gee_chunk_probe.py parallel \
+    --chunk-parents 100 --levels 1 2 4 8 --sample E1b --data-root .localdata/probe_par
+
+# Aggregate + extrapolate to 1950 -> Jul 2026 (536 variable-years). No EE, no cost.
+POSTGRES_HOST=localhost uv run python scripts/gee_chunk_probe.py report \
+    --data-root .localdata/probe_ladder --also .localdata/probe_par
+
 # E2 / E3 — GEE probes, same instrumented path, no bronze/silver writes.
 # NOTE: these run on the HOST, not in a container, so --data-root is a HOST path
 # (.localdata/...), not the container's /data/... . The DAG commands above are the
@@ -387,6 +409,9 @@ DELETE FROM wth_base
 | Sample | Date run | Extent | `N_s` | `E_s` (EECU-h) | `B_s` (GB) | `T_s` (min) | `R_s` (rows) | `D_s` (GB) | Notes |
 |---|---|---|---|---|---|---|---|---|---|
 | E1 (Brazil) | **2026-07-30 — ATTEMPTED, CANCELLED** | `[-34.0,-74.0,5.5,-34.75]` | — | — | — | >20 min/var, incomplete | — | — | **Blocked: see §9.3.** All 7 exports cancelled after repeated >20-minute attempts |
+| E1a (chunk ladder) | 2026-07-31 | same, tmin 2020, 25/100/400 parents | 9 chunks | 0.060 / 0.064 / 0.167 median per task | — | 213 / 218 / 304 s median | — | — | **All 9 completed, `attempts=1`.** Per-task EECU is ~fixed; see §9.4 |
+| E1b (concurrency) | 2026-07-31 | same, 100 parents × 8 chunks × 4 levels | 32 chunks | — | — | 17.5 → 54.1 tasks/h (p1 → p8) | — | — | EE throttles to 4.4 in flight at level 8, net 3.1×; **set `gee_pool` = 4** |
+| E1c (bigger rungs) | 2026-07-31 | same, tmin 2020, 900/1600 parents | 5 chunks | 0.327 / 0.812 median | — | 1,388 / 2,009 s median | — | — | **No ceiling found** — 19,518 cells completed at `attempts=1`, larger than the extent that failed. See §9.4 |
 | SMOKE | 2026-07-30 | `[14.0,-88.0,15.0,-87.0]`, tmax 2020 | 9,150 | 0.0157 | 0.00014 | 1.4 | — | — | 25 cells. `eecu_per_unit` **1.71e-6** — 6.5× worse than Honduras, confirming the overhead floor steepens as extent shrinks. `compression_ratio` **0.25** (a 366-band COG of 25 pixels is mostly header) |
 
 ### 9.3 ⚠ E1 is blocked on export wall-clock, not on cost
@@ -403,14 +428,121 @@ What the surrounding data says about the cause:
 
 The export submits **one image with 366 bands** (`_to_multiband` → `toBands`), so EE computes a full year of daily reductions in a single task, and Brazil additionally mosaics **4 timezone zones per day**. Cost per unit is fine; the single-task granularity is what does not scale.
 
-Levers worth evaluating before retrying E1 (**not yet investigated — deferred to a dedicated session**):
+**Why one big export cannot work, stated precisely** (2026-07-31). The Brazil bbox is 39.5° × 39.25°, i.e. **158 × 157 pixels** at 0.25°. EE computes in 256 × 256 tiles, so the whole country is **smaller than one tile**: there is no spatial parallelism to be had, and one worker holds the entire year. That worker's working set is `pixels_per_band × bands × zones`, and it dies:
 
-- **Split the export by month** — 12 tasks of ~30 bands instead of 1 of 366. More tasks, each far smaller, and they parallelise under `gee_pool`.
-- **Split by variable-month** rather than variable-year in the DAG's `_plan`, making the manifest chunk-aware like the CDS path already is (`src/cds/manifest.py` tracks sub-chunks for exactly this reason).
+| Run | px/band | bands | zones | px-bands | outcome |
+|---|---|---|---|---|---|
+| SMOKE (1°×1°) | 25 | 366 | 1 | 9.2 k | ✅ 86 s |
+| Honduras | ~375 | 366 | 1 | ~137 k | ✅ ~2 min |
+| **Brazil, whole** | 24,806 | 366 | 4 | **36 M** | ❌ EE restarts (`attempt` 2, 3) |
+
+The metrics rows prove the restarts rather than a plain failure: `attempt: 2` and `attempt: 3` with a `start_timestamp_ms` present mean the task *ran* and was restarted by EE, which is what a worker dying looks like. Splitting the extent is therefore not a nicety — it is the only way each piece gets its own worker.
+
+Levers, with the two now built:
+
+- **Split the extent into parent-aligned chunks** — ✅ built, `src/gee/chunks.py`. A chunk is a `k × k` block of parents (`k=10` → 10°×10°) positioned on the canonical grid, so `chunk_id` is a pure function of position and the manifest can resume. `download_variable_year(chunk=...)` writes `<var>_<year>__<chunk_id>.parquet` and marks a **spatial** manifest part, never the whole year.
+- **Cap EE's restarts** — ✅ built, `wait_for_task(max_attempts=...)`. Past the cap the task is cancelled and the run recorded with `attempts`, instead of burning a queue slot for six hours. `attempts` is now folded in per *poll*, because a terminal status need not still carry the field.
+- **Split the export by month** — 12 tasks of ~30 bands instead of 1 of 366. Still open, and cheaper than it looks only if the per-task overhead floor (~90 s, measured at SMOKE) is small next to the work; at 40 chunks × 12 months it would dominate. Measure before adopting.
 - **`int16` with a scale factor** — dropped in §2 as a *cost* measure, but it also cuts bytes moved and may cut export time.
-- **Check whether the 4-zone mosaic is the dominant term** by running Brazil with a single-offset extent of similar cell count.
+- **Check whether the multi-zone mosaic is the dominant term** — now measurable directly: every record carries `n_zones`, so the ladder separates "too many pixels" from "too many timezone mosaics" without a special run.
 
-**This no longer blocks the cost model.** `eecu_per_unit` at continental scale was already measured by `bench-latam` (3.16e-8 → ~113 EECU-h for the full backfill, §6), so E1 would only confirm the intermediate shape of the curve. What remains is an engineering problem: a continental backfill cannot be *run* at acceptable wall-clock until export granularity is fixed, regardless of what it would cost.
+### 9.4 E1a / E1b — chunk sizing, MEASURED 2026-07-31
+
+`scripts/gee_chunk_probe.py`, tmin 2020 over the E1 extent, `--max-attempts 2`. Both go through `download_variable_year`, so they wrote real Parquet and appended ordinary records.
+
+**E1a (ladder, serial, 3 chunks per rung):**
+
+| parents/chunk | box | chunks/var-yr | median task | median EECU-h | max attempt | result |
+|---|---|---|---|---|---|---|
+| 25 | 5°×5° | 62 | 213 s | 0.0601 | 1 | ✅ 3/3 |
+| 100 | 10°×10° | 21 | 218 s | 0.0635 | 1 | ✅ 3/3 |
+| 400 | 20°×20° | 8 | 304 s | 0.1672 | 1 | ✅ 3/3 |
+
+**Nothing failed.** `attempts=1` at every rung, including 20°×20° chunks of 6,037 cells.
+
+**E1c (2026-07-31) pushed to 900 and 1600 parents, and still found no ceiling:**
+
+| parents/chunk | box | biggest sample | median task | median EECU-h | result |
+|---|---|---|---|---|---|
+| 900 | 30°×30° | 9,228 cells, 3 zones | 1,388 s | 0.327 | ✅ 3/3 |
+| 1600 | 40°×40° | **19,518 cells, 3 zones** | 2,009 s | 0.812 | ✅ 2/2 (3rd interrupted by the operator, not EE) |
+
+> ⚠ **This falsifies the raster-size diagnosis in §9.3.** A 40°×40° chunk is **160×160 = 25,600 raster px**, *larger* than the whole-Brazil bbox (158×157 = 24,806 px) that EE kept restarting — and it completed on the first attempt, as did a 4-zone sibling. Neither pixel count nor zone count alone separates the successes from the failure.
+
+### The limit is `land_cells × zones`, and it is knowable offline
+
+**E1d (2026-07-31)** re-ran the unchunked variable-year with `--max-attempts 2`. It **reproduced exactly**: `attempts=3`, `zones=4`, cancelled by the cap after 3,331 s. So the failure is deterministic, not transient — two independent runs, three attempts each.
+
+Ranking all 48 records by `land_cells × zones` separates them cleanly, with no overlap:
+
+| Export | cells | zones | cells×zones | outcome |
+|---|---|---|---|---|
+| `s30r003c-002` | 9,228 | 3 | 27,684 | ✅ attempt 1 |
+| `s40r003c-002` | 5,585 | 4 | 22,340 | ✅ attempt 1 |
+| **`s40r002c-002`** | **19,518** | **3** | **58,554** | ✅ attempt 1 — largest success |
+| **whole extent** | **~22,687** | **4** | **~90,748** | ❌ restarted 3×, twice |
+
+Every export at or below 58,554 completed first time; the only one above it failed twice. The threshold lies between them. This explains why the earlier single-variable theories failed: a 19,518-cell export succeeds at 3 zones, and a 4-zone export succeeds at 5,585 cells, but their **product** is what EE's per-worker budget is spent on — `daily.py` mosaics one clipped reduction per zone per band, so zones multiply the work each cell costs.
+
+**Both terms are known before any EE call.** `era5_land_base_grid` carries `is_land` and `t_zone`, and `t_zone` came from the same shapefile that built `GEE_TZ_ASSET` — so `src/db/grid_query.chunk_land_stats` returns exact cell and zone counts per chunk for one SQL query. `scripts/gee_chunk_probe.py` now refuses to submit a chunk above `CELL_ZONE_CEILING = 58_554` (verified against EE: for `s40r002c-002` the grid predicted 3 zones and EE derived 3), and `--force` overrides it. **This is the guard the production DAG needs when chunking is wired in.**
+
+**E1b (concurrency sweep, 8 chunks of 100 parents per level):**
+
+| level | tasks/h | concurrency reached | median task | net vs serial |
+|---|---|---|---|---|
+| 1 | 13.8 | 0.96 | 213 s | 1.00× |
+| 2 | 25.7 | 1.90 | 200 s | 1.87× |
+| 4 | 46.1 | 3.07 | 238 s | 3.35× |
+| 8 | 54.1 | 4.42 | 248 s | 3.93× |
+
+EE throttles: asking for 8 in flight yields 4.4, and each task slows from 213 s to 248 s. Gains are ~flat past 4. **Set `gee_pool` to 4** — level 8 buys 17% more throughput for double the in-flight load.
+
+**The finding that matters — a task costs a fixed amount plus a per-cell amount.** Least squares over all 47 records:
+
+```
+EECU-h  = 0.0512 + 4.33e-5 × cells     (R² 0.56)
+seconds =    215 + 0.0869 × cells      (R² 0.33)
+```
+
+The fixed term is the 366-band graph over 8,760 hourly source images, paid **per submission**. So chunk size decides how many times you pay it, and the extent's cell count — which barely changes with chunking — decides the rest. Projected over 536 variable-years, using each size's *real* total cell count rather than a sampled median:
+
+| parents/chunk | chunks/var-yr | tasks | EECU-h | quota-months | wall-clock at p8 |
+|---|---|---|---|---|---|
+| 25 | 62 | 33,237 | 2,167 | 2.17 | 30 d |
+| 100 | 21 | 11,258 | 1,102 | 1.10 | 13 d |
+| 400 | 8 | 4,289 | 778 | 0.78 | 7.6 d |
+| 900 | 6 | 3,216 | 767 | 0.77 | 7.1 d |
+| 1600 | 4 | 2,144 | 716 | 0.72 | 6.3 d |
+| *unchunked* | *1* | *536* | *~553* | *0.55* | *untested* |
+
+Consequences:
+
+- **Returns flatten hard after 400.** 25 → 400 saves 64% of the EECU; 400 → 1600 saves 8% more while quadrupling per-task wall-clock (304 s → 2,009 s median) and coarsening restart granularity to 4 pieces.
+- **Chunking buys resumability with EECU.** §6's 113 EECU-h for all of LatAm assumed **one task per variable-year**; it does not survive chunking. Quote it only for unchunked exports.
+- **EECU is the binding constraint for this extent**, not wall-clock: even the best chunked option spends ~72% of a month's Contributor quota on Brazil alone, before LatAm.
+- **Beware `median × chunk_count`.** Chunks vary hugely in land content (the 1600 rung sampled 19,518 and 5,585 cells), so a 3-sample median is not the average chunk. The table above is modelled from the fit; `scripts/gee_chunk_probe.py report` does this and prints both.
+
+**Unchunked is off the table** — E1d reproduced the failure, so the ~553 EECU-h row above is unreachable for this extent. Chunking is mandatory, and the question is only how big.
+
+### Decision: 400 parents (20°×20°)
+
+| | 400 | 1600 |
+|---|---|---|
+| EECU-h (Brazil, full backfill) | 778 | 716 (−8%) |
+| wall-clock at p8 | 7.6 d | 6.3 d |
+| median task | 304 s | 2,009 s |
+| restart granularity | 8 pieces | 4 pieces |
+| worst chunk vs ceiling | 11,994 / 58,554 — **4.9× margin** | 57,960 / 58,554 — **1.01×** |
+
+1600 saves 8% of the EECU and sits *one percent* under a ceiling estimated from a single data point, on an extent whose zone count rises as you move toward LatAm. 400 keeps a ~5× margin for 8% more EECU. Take the margin.
+
+Also settled: **`gee_pool` = 4** (E1b, 2.64× net at p4 vs 3.10× at p8 for double the in-flight load).
+
+**Remaining strategic problem — quota, not throughput.** 778 EECU-h is 78% of one month's Contributor quota for **Brazil alone**. LatAm spans more cells and more zones, so it needs either several months of quota, a smaller variable set, or a shorter start year. That is now the binding constraint on scope, and §6's continental projection needs redoing on the chunked model before any LatAm commitment.
+
+Two smaller notes from the run: exported `cells` differs from the grid's `land_cells` by a few per chunk (LSIB polygon clip vs the ERA5-Land-derived `is_land` mask — expected, not a bug), and `n_zones` was 1–3 per chunk against 4 for whole-Brazil, so chunking also cuts the per-band mosaic term.
+
+**This no longer blocks the cost model** — but it did change it. `eecu_per_unit` at continental scale was measured by `bench-latam` (3.16e-8 → ~113 EECU-h for the full backfill, §6) **with one task per variable-year**. §9.4 shows per-task EECU is dominated by a fixed ~0.035 EECU-h term, so splitting a variable-year into 21 chunks multiplies that term 21×: the same Brazil backfill costs ~715 EECU-h chunked. Wall-clock and EECU now trade directly against each other, and the 113 figure applies only to exports that are not split.
 | E2 | | | | | | | | | |
 | E3 | | | | | | | | | |
 | C1 | | | | | | | | | |
