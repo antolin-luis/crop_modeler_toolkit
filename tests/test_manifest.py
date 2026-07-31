@@ -21,6 +21,26 @@ def test_chunk_idempotency(tmp_path):
     assert not m.is_chunk_done("tmax", 1995, "1995-07-01", "1995-12-31")
 
 
+def test_spatial_chunk_idempotency(tmp_path):
+    m = Manifest(tmp_path / "_manifest.json")
+    assert not m.is_spatial_chunk_done("tmin", 2020, "s10r009c007")
+    m.mark_spatial_chunk_done("tmin", 2020, "s10r009c007")
+    assert m.is_spatial_chunk_done("tmin", 2020, "s10r009c007")
+    assert not m.is_spatial_chunk_done("tmin", 2020, "s10r009c008")
+    # A part landing never implies the year did — the caller owning the full extent
+    # decides that, and a chunked backfill would otherwise stop after its first chunk.
+    assert not m.is_var_year_done("tmin", 2020)
+
+
+def test_spatial_and_time_chunks_share_a_list_without_colliding(tmp_path):
+    m = Manifest(tmp_path / "_manifest.json")
+    m.mark_chunk_done("tmax", 2020, "2020-01-01", "2020-01-31")
+    m.mark_spatial_chunk_done("tmax", 2020, "2020-01-01")  # id shaped like a date
+    assert m.is_chunk_done("tmax", 2020, "2020-01-01", "2020-01-31")
+    assert m.is_spatial_chunk_done("tmax", 2020, "2020-01-01")
+    assert not m.is_spatial_chunk_done("tmax", 2020, "2020-01-31")
+
+
 def test_restart_skips_done(tmp_path):
     path = tmp_path / "_manifest.json"
     m1 = Manifest(path)

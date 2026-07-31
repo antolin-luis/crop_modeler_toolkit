@@ -124,22 +124,61 @@ def start_export(
     return task
 
 
+def task_attempt(status: dict | None) -> int:
+    """EE's restart counter for a task, 1 if absent.
+
+    EE increments ``attempt`` when it restarts a task whose worker died — the signature of
+    an export too big for one worker rather than one that is merely slow. It is the field
+    that distinguishes "still queued" from "failing repeatedly", and nothing in the status
+    dict says so explicitly.
+    """
+    if not isinstance(status, dict):
+        return 1
+    raw = status.get("attempt")
+    try:
+        return max(1, int(raw))
+    except (TypeError, ValueError):
+        return 1
+
+
 def wait_for_task(
     task: "ee.batch.Task",
     *,
     poll_interval: float = 20.0,
     timeout: float = 6 * 3600.0,
+    max_attempts: int | None = None,
+    on_poll: Callable[[dict], None] | None = None,
     sleep: Callable[[float], None] = time.sleep,
     now: Callable[[], float] = time.monotonic,
 ) -> dict:
     """Block until ``task`` reaches a terminal state; return its final status dict.
 
     Raises on FAILED/CANCELLED or if ``timeout`` elapses first.
+
+    ``max_attempts`` caps EE's own restarts: once ``attempt`` exceeds it the task is
+    cancelled and a ``RuntimeError`` raised, instead of letting EE burn a queue slot (and
+    EECU) rediscovering that the export is too big. Cancelling is best-effort — a failed
+    cancel must not mask the diagnosis.
+
+    ``on_poll`` receives every status dict, terminal one included, so a caller can record
+    the attempt count that a terminal-state-only view would lose.
     """
     deadline = now() + timeout
     while True:
         status = task.status()
         state = status.get("state")
+        if on_poll is not None:
+            on_poll(status)
+        attempt = task_attempt(status)
+        if max_attempts is not None and attempt > max_attempts:
+            try:
+                task.cancel()
+            except Exception:  # pragma: no cover — diagnostic path only
+                pass
+            raise RuntimeError(
+                f"GEE export exceeded max_attempts={max_attempts}: EE is on attempt "
+                f"{attempt} (state {state}) — the export is too big for one task"
+            )
         if state in _TERMINAL:
             if state != "COMPLETED":
                 raise RuntimeError(

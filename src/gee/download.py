@@ -24,6 +24,8 @@ import tempfile
 import time
 from pathlib import Path
 
+from typing import TYPE_CHECKING
+
 import pyarrow as pa
 import pyarrow.parquet as pq
 
@@ -32,6 +34,9 @@ from src.gee.export import iter_geotiff_chunks, tz_zones
 from src.gee.metrics import RunMetrics, append_record, metrics_path, run_export
 from src.gee.variables import COLLECTION
 from src.grid.encode_long import DEFAULT_BLOCK_SIZE_B, encode_grid
+
+if TYPE_CHECKING:  # pragma: no cover — annotation only, keeps the import cost off the DAG
+    from src.gee.chunks import Chunk
 
 
 def download_variable_year(
@@ -48,6 +53,10 @@ def download_variable_year(
     land_only: bool = True,
     sample: str | None = None,
     metrics_out: dict | None = None,
+    chunk: "Chunk | None" = None,
+    land_parents: int | None = None,
+    max_attempts: int | None = None,
+    parallel: int | None = None,
 ) -> Path:
     """Download one ``(variable, year)`` to ``bronze/<var>/<var>_<year>.parquet``.
 
@@ -65,14 +74,34 @@ def download_variable_year(
     with the calibration sample id it feeds, and ``metrics_out``, if given, receives the
     same record for the caller to log or push to XCom. A manifest hit returns early and
     records nothing, because nothing was measured.
+
+    **Chunked mode.** Pass ``chunk`` (a :class:`src.gee.chunks.Chunk`) to fetch one
+    parent-aligned block of ``extent`` instead of the whole thing — the fix for a
+    continental extent that EE restarts until it is cancelled
+    (docs/cost_model_climate_context.md §9.3). The chunk's own box replaces ``extent``, the
+    Parquet lands at ``<var>_<year>__<chunk_id>.parquet``, and the manifest tracks the part
+    rather than the year, so the year is only "done" once its caller says every part is in.
+    ``max_attempts`` aborts the export when EE restarts it more than that many times, which
+    is the signal that the chunk is still too big. ``land_parents``/``parallel`` are pure
+    metrics context, recorded so a size ladder can be read back off the JSONL.
     """
+    if chunk is not None:
+        extent = list(chunk.extent)
+    chunk_id = chunk.chunk_id if chunk is not None else None
+    suffix = f"__{chunk_id}" if chunk_id else ""
+
     out_dir = Path(bronze_dir) / variable
-    out_path = out_dir / f"{variable}_{year}.parquet"
-    if manifest.is_var_year_done(variable, year) and out_path.exists():
+    out_path = out_dir / f"{variable}_{year}{suffix}.parquet"
+    done = (
+        manifest.is_spatial_chunk_done(variable, year, chunk_id)
+        if chunk_id
+        else manifest.is_var_year_done(variable, year)
+    )
+    if done and out_path.exists():
         return out_path
 
     bucket = client.require_bucket()
-    name_prefix = f"{client.gcs_prefix}/{variable}_{year}"
+    name_prefix = f"{client.gcs_prefix}/{variable}_{year}{suffix}"
     m = RunMetrics(
         kind="bronze_var_year",
         dataset=COLLECTION,
@@ -85,9 +114,14 @@ def download_variable_year(
         b=b,
         chunk_days=chunk_days,
         gee_project=getattr(client, "project", None),
+        chunk_id=chunk_id,
+        parents=chunk.n_parents if chunk is not None else None,
+        land_parents=land_parents,
+        parallel=parallel,
     )
     try:
         zones = tz_zones(extent, tz_asset)
+        m.note_zones(len(zones))
         daily_col = build_daily_collection(variable, year, zones=zones)
 
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -103,6 +137,7 @@ def download_variable_year(
                 dest_dir=td,
                 metrics=m,
                 land_only=land_only,
+                max_attempts=max_attempts,
             )
             t_encode = time.monotonic()
             try:
@@ -132,7 +167,10 @@ def download_variable_year(
             )
         os.replace(tmp_path, out_path)
         m.note_encode_done(seconds=time.monotonic() - t_encode, parquet_path=out_path)
-        manifest.mark_var_year_done(variable, year)
+        if chunk_id:
+            manifest.mark_spatial_chunk_done(variable, year, chunk_id)
+        else:
+            manifest.mark_var_year_done(variable, year)
         return out_path
     except BaseException as exc:  # noqa: BLE001 — recorded, then re-raised untouched
         # A failed run still carries task_id and t_export_s, which is exactly what you

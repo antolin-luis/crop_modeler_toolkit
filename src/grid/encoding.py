@@ -10,7 +10,7 @@ banker's rounding and ties-to-even exactly on a cell boundary.
 
 import numpy as np
 
-from src.grid.spec import ALPHABET, NLON, RESOLUTION
+from src.grid.spec import ALPHABET, NLAT, NLON, RESOLUTION
 
 ALPH = ALPHABET
 RES = RESOLUTION
@@ -60,6 +60,56 @@ def parent_code(lat: float, lon: float, b: int) -> str:
         n, r = divmod(n, 36)
         s = ALPH[r] + s
     return s
+
+
+def parent_indices(code: str, b: int) -> tuple[int, int]:
+    """Decode a parent code back to its ``(p_row, p_col)`` block indices."""
+    n = 0
+    for c in code:
+        n = n * 36 + ALPH.index(c)
+    n_pcols = -(-NLON // b)                 # ceil division
+    return divmod(n, n_pcols)
+
+
+def parent_bbox(p_row: int, p_col: int, b: int) -> list[float]:
+    """``[S, W, N, E]`` cell-edge bounds of one parent block, in -180..180 lon.
+
+    The box spans the *edges* of the member cells (centre ± half a cell), so adjacent
+    parents tile without gap or overlap. Two irregular blocks exist by construction and
+    are handled, not special-cased away: ``NLAT=721`` is not a multiple of ``b``, so the
+    last parent row is short (at b=4 it holds only the south-pole row), and the same is
+    true of the last parent column whenever ``b`` does not divide ``NLON``.
+
+    Raises on a block that straddles the antimeridian, because there is no single valid
+    ``[W, E]`` rectangle for it — the caller must handle the wrap explicitly. Such blocks
+    do exist: cell centres run to 180.0, so at b=4 the column holding centres
+    180.00–180.75 spans edges 179.875–180.875 and crosses the seam. Nothing in this
+    project's extents reaches it, and a silent wrap would be far worse than a raise.
+    """
+    lat_idx_lo = p_row * b
+    lat_idx_hi = min((p_row + 1) * b, NLAT) - 1
+    lon_idx_lo = p_col * b
+    lon_idx_hi = min((p_col + 1) * b, NLON) - 1
+    if lat_idx_lo >= NLAT or lon_idx_lo >= NLON:
+        raise ValueError(f"parent block ({p_row}, {p_col}) is outside the grid")
+
+    north = 90.0 - lat_idx_lo * RES + RES / 2.0
+    south = 90.0 - lat_idx_hi * RES - RES / 2.0
+    west = lon_idx_lo * RES - RES / 2.0
+    east = lon_idx_hi * RES + RES / 2.0
+    if west >= 180.0:                        # wholly in the eastern-negative half
+        west, east = west - 360.0, east - 360.0
+    elif east > 180.0:
+        raise ValueError(
+            f"parent block ({p_row}, {p_col}) straddles the antimeridian; "
+            "no single [W, E] rectangle represents it"
+        )
+    return [south, west, north, east]
+
+
+def parent_code_bbox(code: str, b: int) -> list[float]:
+    """``parent_bbox`` straight from a parent code — the inverse of :func:`parent_code`."""
+    return parent_bbox(*parent_indices(code, b), b)
 
 
 # --- Vectorized variants (seed build, ~1M cells; PLANNING.md §8.1) ---------------
