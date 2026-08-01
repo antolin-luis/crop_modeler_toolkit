@@ -72,7 +72,12 @@ services:
         # Cap simultaneous CDS requests (download_bronze binds to this pool, §10).
         airflow pools set cds_pool 2 "CDS request cap"
         # Cap simultaneous GEE export tasks (download_bronze_gee binds to this pool).
-        airflow pools set gee_pool 2 "GEE export cap"
+        # 4, not 2: measured E1b, four in-flight exports are a net 2.64x over serial, and
+        # 8 buys only 3.10x for double the load — EE throttles to ~4.4 running anyway.
+        # `pools set` overwrites, so this resizes an existing pool too — but only when
+        # airflow-init actually re-runs. A stack that is already up keeps the old size
+        # until then; resize it live per docs/runbook.md §3.1.
+        airflow pools set gee_pool 4 "GEE export cap"
         # Cap simultaneous silver year-transforms (transform_silver binds to this pool).
         # ~220 MB per task process on the Pi target; tune slots live in Admin -> Pools.
         airflow pools set silver_pool 3 "Silver transform memory cap"

@@ -70,6 +70,12 @@ Two functions, both pure:
 
 GFS is native 0.25° on the same origin as ERA5. Phase 6 writes `child_id` directly and never touches `fspec`/`fencoding`. This is the single biggest cost difference between the two forecast paths.
 
+**But it does inherit the export budget.** Every GEE-backed phase here rides the same export machinery as the ERA5 backfill, and that machinery has a measured ceiling: past a certain size EE restarts the export (`attempt` 2, 3) instead of running it, indefinitely, until something cancels it. For ERA5 the failure predictor is `land_cells × zones` and the line sits at **58,554** (`docs/cost_model_climate_context.md` §9.4, `src/gee/chunks.CELL_ZONE_CEILING`).
+
+⚠ **That number does not transfer.** It was measured at **366 daily bands** per export. The general quantity is `cells × zones × bands`: Brazil's failure was ≈ 33.2 M cell-zone-bands, the largest success ≈ 21.4 M. A 16-band GFS export and a 36-band dekadal NDVI export sit in completely different places on that scale.
+
+So: **each new source confirms its own budget with one probe export at the target extent before its first backfill.** Do not assume ERA5's number, in either direction — it is as wrong to chunk a 16-band GFS export as if it were an ERA5 year as it is to submit a 365-band CHIRPS year unchunked because "GFS was fine".
+
 ---
 
 ## 4. Bronze layout (complete, final)
@@ -400,7 +406,7 @@ Four new DAGs. Splitting them (rather than one `update_context`) is driven by ca
 | `update_forecast` | monthly (SEAS5, NMME) + daily (GFS) | Download → bronze → TRUNCATE-partition refresh of `forecast_value`. One mapped task per system so a SEAS5 failure does not block GFS. |
 | `update_hazards` | 6-hourly during season, else daily | NHC active advisories → `tc_track`; `drought_alert` recompute. The 6-hourly cadence is precisely why this is not folded into `update_forecast`. |
 
-**Pools.** Add `context_pool` alongside the existing `cds_pool` / `gee_pool` / `silver_pool`, so index and cyclone HTTP fetches cannot starve a running ERA5 backfill. GFS work goes through the existing `gee_pool` — it competes for the same EECU quota.
+**Pools.** Add `context_pool` alongside the existing `cds_pool` / `gee_pool` / `silver_pool`, so index and cyclone HTTP fetches cannot starve a running ERA5 backfill. GFS work goes through the existing `gee_pool` — now capped at **4**, not 2 (measured E1b: four in-flight exports are a net 2.64× over serial) — and it competes for the same EECU quota. Sharper than it sounds given §10 below: that is a quota the ERA5 backfill has already largely spent.
 
 **New DAG params** (all with defaults, per §2):
 
@@ -414,6 +420,8 @@ Four new DAGs. Splitting them (rather than one `update_context`) is driven by ca
 | `chirps_start_year` | build_context_base | default `now - 10y` — see §10 |
 | `iso3_list` | build_context_base | admin boundaries to load, default `["HND"]` |
 | `spi_scales` | update_hazards | default `[3, 6]` |
+| `chunk_parents` | any GEE-backed DAG (`update_forecast` GFS leg, `build_context_base` CHIRPS leg) | Parents per export chunk, mirroring `download_bronze_gee`. `0` = whole extent in one export. The per-source default comes from that source's probe run (§3.4), not from ERA5's 400. |
+| `max_attempts` | same | EE restarts tolerated before the export is abandoned; `2` everywhere |
 
 ---
 
@@ -461,7 +469,8 @@ Four stages. Each phase lists deliverable, tests, and an acceptance criterion th
 - `src/forecast/gfs.py` reusing `src/gee/` export machinery; writes `cell_id = child_id`, `cell_grid = 'era5_025'`, `member = 0`.
 - Daily schedule; bronze retention 30 days.
 - *Tests:* `test_gfs.py` — daily period rows (`target_end = target_start`) coexist with SEAS5 monthly rows under one PK; `lead_days` computed correctly across an init-time boundary.
-- *Accept:* `forecast_value` simultaneously holds SEAS5 monthly and GFS daily rows, and a single query returns a coherent "next 16 days daily, then months 1–7" series for one location.
+- **Export budget (§3.4).** 16 bands (one init's lead days), and the per-cell local day applies, so the same tz zones as ERA5. 23× fewer bands than an ERA5 year — pressure is **low**, and at a Central America extent it likely needs no chunking at all. Confirm with one probe run; do not assume.
+- *Accept:* `forecast_value` simultaneously holds SEAS5 monthly and GFS daily rows, and a single query returns a coherent "next 16 days daily, then months 1–7" series for one location — **and that export completed at `attempts=1`**.
 
 ### Stage 3 — Enrichment
 
@@ -474,7 +483,8 @@ Four stages. Each phase lists deliverable, tests, and an acceptance criterion th
 - *Accept:* Hurricane Mitch (1998) exposure over Honduras returns a plausible cell set with correct dates — a case with a known answer.
 
 **Phase 9 — CHIRPS → `wth_precip_alt`** (GEE; default 10-year window per §10)
-- *Accept:* CHIRPS and ERA5 monthly precip for the same cells correlate as expected, and their disagreement over complex terrain is visible — which is the reason to have both.
+- **Export budget (§3.4).** 365 bands per year — ERA5's order — but CHIRPS is already a daily product, so there is **no local-day reduction and no zone mosaic**: `zones = 1`. Losing the zone multiplier takes the budget ~4× further than ERA5's at the same extent. Pressure **low-moderate**; probe one year before backfilling ten.
+- *Accept:* CHIRPS and ERA5 monthly precip for the same cells correlate as expected, and their disagreement over complex terrain is visible — which is the reason to have both. One export at the target extent completes at `attempts=1`.
 
 **Phase 10 — NMME → `forecast_value`** (schema already proven by Phase 4; mostly a new fetch adapter)
 
@@ -489,6 +499,7 @@ Four stages. Each phase lists deliverable, tests, and an acceptance criterion th
 - *Accept:* municipality alert counts are reproducible and the status thresholds are documented constants, not magic numbers.
 
 **Phase 13 — NDVI anomaly** (lowest priority; least connected to crop modeling)
+- **Export budget (§3.4).** ~36 dekads per year, `zones = 1`. Pressure **negligible**. Still: `attempts=1` on the first export, because the cost of checking is one grep.
 
 ---
 
@@ -534,6 +545,21 @@ Order-of-magnitude, Central America extent (~18° × 15°). These drive real des
 1. **GFS daily churn.** ~10⁷ rows replaced every day is exactly the workload that makes `DELETE` untenable and `TRUNCATE`-on-partition necessary (§5.3). This is the single most important operational consequence of the current-only decision.
 2. **CHIRPS is not a small addition.** A full 46-year CHIRPS backfill at 0.25° is the same order of magnitude as the entire existing `wth_base` — potentially ~100 GB+. That may well be worth it, but it is a deliberate decision, not a side effect of "add CHIRPS". Hence `chirps_start_year` defaulting to a 10-year window with full backfill as opt-in.
 
+### 10.1 EECU budget — the actually binding constraint
+
+Rows and disk are the easy part. The scarce resource is **GEE compute**: 1,000 EECU-h/month on the Contributor tier, shared with the ERA5 backfill, which has already claimed most of it — a chunked Brazil backfill alone models at ~778 EECU-h, 78% of one month.
+
+Per-task cost fits `0.0512 + 4.33e-5 × cells` EECU-h (`docs/cost_model_climate_context.md` §9.4). The fixed term dominates for small exports, which is why band count and task count matter more than pixel count here.
+
+| Phase | GEE? | Cadence | EECU-h per run | Notes |
+|---|---|---|---|---|
+| 6 GFS | yes | **daily** | measure in E2 | The only *recurring* GEE cost in this plan, and therefore the one to size carefully. 16 bands, but 365 runs a year. |
+| 9 CHIRPS | yes | one-off + annual top-up | ~ERA5 var-year per year of history | 10-year default window keeps this bounded; a full 46-year backfill is an ERA5-scale commitment on its own |
+| 13 NDVI | yes | one-off + dekadal | small | ~36 bands, 1 zone |
+| all others | no | — | 0 | CDS, HTTP or PostGIS only |
+
+**E2 (measure GFS daily burn) gates enabling the daily schedule.** A recurring cost that competes with the backfill has to be a measured number before it is switched on, not after.
+
 ---
 
 ## 11. Risks
@@ -547,6 +573,8 @@ Order-of-magnitude, Central America extent (~18° × 15°). These drive real des
 | `forecast_value` bloat | TRUNCATE-partition refresh (§5.3); monitor table size in the runbook |
 | IRI plume is chart-oriented, may need scraping | Prefer the IRI Data Library API; if only the chart is available, treat as best-effort and mark Phase 7 optional |
 | Scope creep into gold | Explicitly out of scope; the ensemble-`.WTH` idea is recorded in the feasibility doc, not here |
+| A GEE export exceeds the `cells × zones × bands` budget and EE restarts it indefinitely | `max_attempts=2` on every export so the loss is bounded; `plan_chunks` refuses over-ceiling chunks offline; one probe export per new source before its first backfill (§3.4) |
+| GEE EECU quota exhausted by the ERA5 backfill, starving the context layer | Schedule the ERA5 chunked backfill in year windows across months (§10.1); measure GFS daily burn with E2 before enabling its schedule |
 
 ---
 
@@ -564,4 +592,6 @@ Order-of-magnitude, Central America extent (~18° × 15°). These drive real des
 
 Per `CLAUDE.md`'s plan-driven workflow: branch first, code on the branch, stop for user testing, wait for explicit authorization before commit/PR/merge.
 
-Recommended first branch: **`context-phase0-1-normals`** — Phase 0 scaffolding plus Phase 1 `wth_normals`. It touches no external API, needs no new credentials, is fully testable offline against the existing `wth_base`, and unlocks every anomaly-based product downstream. If something in the schema design is wrong, this is the cheapest phase in which to discover it.
+Recommended first branch: **`context-phase0-1-normals`** — Phase 0 scaffolding plus Phase 1 `wth_normals`. It touches no external API, needs no new credentials, is fully testable offline against the existing `wth_base`, and unlocks every anomaly-based product downstream. If something in the schema design is wrong, this is the cheapest phase in which to discover it. It also touches no GEE at all, so nothing in §3.4 blocks it.
+
+Phases 6 and 9 are the ones that do: they must not start before the chunked-export work lands on `download_bronze_gee` (`docs/plan_gee_chunked_backfill.md` Part A), or they will re-invent chunking with a different, unmeasured ceiling.

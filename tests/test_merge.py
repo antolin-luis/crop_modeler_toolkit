@@ -23,16 +23,19 @@ NATIVE = {
 }
 
 
-def _write_bronze(root, year=2020, variables=ALL_VARIABLES, children=(CHILD,)):
+def _write_bronze(
+    root, year=2020, variables=ALL_VARIABLES, children=(CHILD,), parent=PARENT, suffix=""
+):
+    """Write one parquet per variable. ``suffix`` writes a chunk file (``__<chunk_id>``)."""
     for var in variables:
         frame = pd.DataFrame(
             [
-                {"child_id": c, "parent_id": PARENT, "date": d, "value": NATIVE[var]}
+                {"child_id": c, "parent_id": parent, "date": d, "value": NATIVE[var]}
                 for c in children
                 for d in DATES
             ]
         )
-        path = merge.var_year_path(root, var, year)
+        path = root / var / f"{var}_{year}{suffix}.parquet"
         path.parent.mkdir(parents=True, exist_ok=True)
         frame.to_parquet(path, index=False)
     return root
@@ -117,6 +120,82 @@ def test_parent_batches_filter_the_scan(tmp_path):
 
     assert len(merge.load_var_year(tmp_path, "tmax", 2020, [PARENT])) == 2
     assert merge.load_var_year(tmp_path, "tmax", 2020, ["ZZZZ"]).empty
+
+
+# --- chunked bronze ----------------------------------------------------------------
+# A chunked GEE export writes <var>_<year>__<chunk_id>.parquet, one file per spatial
+# chunk. Resolving only the unsuffixed name made transform_silver report the variable
+# absent and silently produce nothing.
+CHUNKS = ["__s20r003c-003", "__s20r003c-002", "__s20r004c-003"]
+
+
+def _write_chunked(root, year=2020, variables=ALL_VARIABLES):
+    """Three chunk files per variable, each holding its own parent and cell."""
+    for i, suffix in enumerate(CHUNKS):
+        _write_bronze(
+            root, year, variables, children=(f"CEL{i}",), parent=f"P{i:03d}", suffix=suffix
+        )
+    return root
+
+
+def test_chunked_var_year_is_discovered(tmp_path):
+    _write_chunked(tmp_path)
+
+    assert merge.available_variables(tmp_path, 2020) == list(ALL_VARIABLES)
+    assert len(merge.var_year_paths(tmp_path, "tmax", 2020)) == 3
+
+
+def test_chunked_var_year_reads_back_as_one_frame(tmp_path):
+    """Three chunk files must give the same rows as the same data written as one file."""
+    _write_chunked(tmp_path, variables=["tmax"])
+    one = tmp_path / "one"
+    _write_bronze(one, variables=["tmax"], children=("CEL0", "CEL1", "CEL2"))
+
+    chunked = merge.load_var_year(tmp_path, "tmax", 2020)
+    assert len(chunked) == len(merge.load_var_year(one, "tmax", 2020))
+    assert set(zip(chunked["child_id"], chunked["date"])) == {
+        (c, d) for c in ("CEL0", "CEL1", "CEL2") for d in DATES
+    }
+
+
+def test_parent_batches_union_across_chunks(tmp_path):
+    _write_chunked(tmp_path)
+
+    assert list(merge.iter_parent_batches(tmp_path, 2020, batch_size=8)) == [
+        ["P000", "P001", "P002"]
+    ]
+    # A parent lives in exactly one chunk, and the filter still finds it.
+    assert len(merge.load_var_year(tmp_path, "tmax", 2020, ["P001"])) == 2
+
+
+def test_build_wide_spans_chunk_files(tmp_path):
+    _write_chunked(tmp_path)
+    meta = pd.DataFrame(
+        {"child_id": ["CEL0", "CEL1", "CEL2"], "lat": [-34.9] * 3, "elevation": [50.0] * 3}
+    )
+
+    wide = merge.build_wide(tmp_path, 2020, ["P000", "P002"], meta)
+
+    assert sorted(set(wide["child_id"])) == ["CEL0", "CEL2"]
+    assert np.isfinite(wide["et0"]).all()
+
+
+def test_unchunked_bronze_still_resolves(tmp_path):
+    """The legacy single-file layout (CDS backend, existing bronze dirs) is unchanged."""
+    _write_bronze(tmp_path, variables=["tmax"])
+
+    paths = merge.var_year_paths(tmp_path, "tmax", 2020)
+    assert [p.name for p in paths] == ["tmax_2020.parquet"]
+
+
+def test_a_different_year_is_not_globbed_in(tmp_path):
+    """<var>_<year>* must not reach into a neighbouring year."""
+    _write_bronze(tmp_path, year=2020, variables=["tmax"])
+    _write_bronze(tmp_path, year=2021, variables=["tmax"], suffix="__s20r003c-003")
+
+    assert [p.name for p in merge.var_year_paths(tmp_path, "tmax", 2020)] == [
+        "tmax_2020.parquet"
+    ]
 
 
 def test_float_noise_negatives_snap_to_zero(tmp_path):

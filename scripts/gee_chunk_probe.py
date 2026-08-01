@@ -55,12 +55,11 @@ import statistics
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
 from pathlib import Path
 
 from src.cds.manifest import Manifest
 from src.config import load_config, resolve_bronze_dir
-from src.gee.chunks import Chunk, tile_extent
+from src.gee.chunks import CELL_ZONE_CEILING, PlannedChunk, plan_chunks, side_of
 from src.gee.client import GEEClient
 from src.gee.download import download_variable_year
 from src.gee.metrics import iter_records, metrics_path
@@ -81,13 +80,6 @@ EGRESS_USD_PER_GB = 0.12
 EECU_USD_PER_HOUR = 0.40
 EECU_QUOTA_PER_MONTH = 1000.0  # Contributor tier (docs/gee_setup.md §1)
 
-# land_cells x timezone_zones above which EE restarts the export instead of running it.
-# Measured 2026-07-31: everything <= 58,554 completed on attempt 1; the whole-Brazil
-# extent at ~90,748 was restarted 3x in two independent runs. The limit sits between
-# those, so the guard trips at the largest value actually observed to work and the
-# --force flag exists to move it. See docs/cost_model_climate_context.md §9.4.
-CELL_ZONE_CEILING = 58_554
-
 
 def backfill_var_years() -> float:
     """Variable-years in a 1950 → Jul-2026 backfill: whole years plus the partial one."""
@@ -95,57 +87,26 @@ def backfill_var_years() -> float:
     return (whole + BACKFILL_END_MONTHS / 12.0) * N_VARIABLES
 
 
-@dataclass
-class Plan:
-    """One export the probe intends to run."""
-
-    chunk: Chunk
-    land_parents: int
-    land_cells: int
-    zones: int = 0
-
-    @property
-    def cell_zones(self) -> int:
-        return self.land_cells * max(self.zones, 1)
-
-    @property
-    def over_ceiling(self) -> bool:
-        """True when the evidence says EE will restart this export rather than run it."""
-        return bool(self.land_cells) and self.cell_zones > CELL_ZONE_CEILING
-
-
-def side_of(parents_per_chunk: int) -> int:
-    """Chunk side in parents. Sizes are quoted per *chunk* (100 parents = a 10x10 block)."""
-    side = round(parents_per_chunk ** 0.5)
-    if side * side != parents_per_chunk:
-        raise SystemExit(
-            f"--sizes/--chunk-parents must be perfect squares (a chunk is square); "
-            f"{parents_per_chunk} is not — nearest are {side ** 2} and {(side + 1) ** 2}"
-        )
-    return side
+# The probe and the DAG plan exports the same way, through the same ceiling guard
+# (src/gee/chunks.plan_chunks). ``Plan`` stays as the local name the rest of this script
+# reads by.
+Plan = PlannedChunk
 
 
 def build_plan(
     extent: list[float], parents_per_chunk: int, *, use_db: bool
 ) -> list[Plan]:
-    """Chunks covering ``extent`` at one size, land-bearing ones first (most land first)."""
-    chunks = tile_extent(extent, side_of(parents_per_chunk))
-    if not use_db:
-        return [Plan(chunk=c, land_parents=0, land_cells=0) for c in chunks]
+    """Chunks covering ``extent`` at one size, land-bearing ones first (most land first).
 
-    from src.db.grid_query import chunk_land_stats
-
-    stats = chunk_land_stats(chunks)
-    plans = [
-        Plan(
-            chunk=c,
-            land_parents=stats[c.chunk_id].land_parents,
-            land_cells=stats[c.chunk_id].land_cells,
-            zones=stats[c.chunk_id].zones,
-        )
-        for c in chunks
-        if stats[c.chunk_id].land_cells > 0
-    ]
+    Sorted by land cells, unlike the DAG's canonical tile order: the probe samples the
+    extremes of the size range (see :func:`pick_samples`), and that ordering is what makes
+    "biggest" and "smallest" mean anything.
+    """
+    try:
+        side = side_of(parents_per_chunk)
+    except ValueError as exc:
+        raise SystemExit(f"--sizes/--chunk-parents: {exc}") from exc
+    plans = plan_chunks(extent, side, use_db=use_db)
     plans.sort(key=lambda p: p.land_cells, reverse=True)
     return plans
 

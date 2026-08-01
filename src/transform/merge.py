@@ -1,9 +1,10 @@
 """Per-variable bronze parquet → wide silver frame (PLANNING.md §8.3).
 
-Bronze is one long ``[child_id, parent_id, date, value]`` file per variable per year
-(§7); silver is one wide row per ``(child_id, date)`` (§8.2). This module does that
-reshape, applies the §5.1 unit conversions, and derives the columns that need several
-aligned variables at once: ``wind``, ``rh`` (Tetens) and ``et0`` (FAO-56).
+Bronze is a long ``[child_id, parent_id, date, value]`` layout, one *or more* files per
+variable per year (§7 — a chunked GEE export writes one file per spatial chunk); silver is
+one wide row per ``(child_id, date)`` (§8.2). This module does that reshape, applies the
+§5.1 unit conversions, and derives the columns that need several aligned variables at
+once: ``wind``, ``rh`` (Tetens) and ``et0`` (FAO-56).
 
 **Everything is parent-batched.** A whole var-year for a continental extent is ~20M rows
 (~1.4 GB in pandas) times seven variables — far past what the Pi can hold (§2). Reading a
@@ -43,16 +44,32 @@ VALUE_COLUMNS = ["tmax", "tmin", "precip", "srad", "wind", "tdew", "rh", "et0"]
 NOISE_TOLERANCE = {"precip": 0.01, "srad": 0.01}  # mm/day, MJ/m²/day
 
 
-def var_year_path(bronze_dir: str | Path, variable: str, year: int) -> Path:
-    """Bronze parquet path for one ``(variable, year)`` — the §7 layout."""
-    return Path(bronze_dir) / variable / f"{variable}_{year}.parquet"
+def var_year_paths(bronze_dir: str | Path, variable: str, year: int) -> list[Path]:
+    """Bronze parquet files for one ``(variable, year)`` — the §7 layout, sorted.
+
+    A var-year is **one or more** files. The GEE backend splits a continental extent into
+    parent-aligned export chunks (``src/gee/chunks.py``) and writes one
+    ``<var>_<year>__<chunk_id>.parquet`` per chunk, because a single whole-extent export
+    does not complete. An unchunked var-year is the same thing with one file, so the glob
+    covers both and the CDS backend needs no change.
+
+    Chunks tile without overlap, so the files concatenate with no deduplication — see the
+    ``src.gee.chunks`` module docstring for why that property is guaranteed by
+    construction. Sorted so a batch reads its inputs in the same order every run.
+    """
+    return sorted((Path(bronze_dir) / variable).glob(f"{variable}_{year}*.parquet"))
+
+
+def _dataset(paths: list[Path]):
+    """Parquet dataset over one var-year's files. ``str`` — pyarrow lists want plain paths."""
+    return ds.dataset([str(p) for p in paths], format="parquet")
 
 
 def available_variables(
     bronze_dir: str | Path, year: int, variables: Sequence[str] = ALL_VARIABLES
 ) -> list[str]:
-    """Subset of ``variables`` whose parquet exists for ``year``."""
-    return [v for v in variables if var_year_path(bronze_dir, v, year).exists()]
+    """Subset of ``variables`` with at least one parquet file for ``year``."""
+    return [v for v in variables if var_year_paths(bronze_dir, v, year)]
 
 
 def iter_parent_batches(
@@ -69,7 +86,7 @@ def iter_parent_batches(
     """
     parents: set[str] = set()
     for var in available_variables(bronze_dir, year, variables):
-        table = ds.dataset(var_year_path(bronze_dir, var, year), format="parquet")
+        table = _dataset(var_year_paths(bronze_dir, var, year))
         column = table.to_table(columns=["parent_id"])["parent_id"]
         parents.update(column.unique().to_pylist())
 
@@ -86,9 +103,11 @@ def load_var_year(
 ) -> pd.DataFrame:
     """Read one bronze ``(variable, year)``, optionally filtered to ``parent_ids``.
 
-    Returns the long frame with ``value`` renamed to ``variable``.
+    Returns the long frame with ``value`` renamed to ``variable``. Chunked var-years are
+    read as one dataset over their files, so the ``parent_ids`` filter still pushes down
+    into each parquet scan and a parent split across chunk files comes back whole.
     """
-    dataset = ds.dataset(var_year_path(bronze_dir, variable, year), format="parquet")
+    dataset = _dataset(var_year_paths(bronze_dir, variable, year))
     filt = None if parent_ids is None else ds.field("parent_id").isin(list(parent_ids))
     frame = dataset.to_table(filter=filt).to_pandas()
     return frame.rename(columns={"value": variable})

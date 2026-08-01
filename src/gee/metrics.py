@@ -407,6 +407,7 @@ def run_export(
     poll_interval: float = 20.0,
     timeout: float = 6 * 3600.0,
     max_attempts: int | None = None,
+    on_poll=None,
 ) -> list[Path]:
     """Submit, wait, fetch — each phase timed into ``metrics``. Returns local shards.
 
@@ -422,9 +423,19 @@ def run_export(
     ``max_attempts`` bounds EE's internal restarts (see ``export.wait_for_task``); the
     attempt count reaches the record either way, because polls are folded into ``metrics``
     as they happen rather than read off the terminal status.
+
+    ``on_poll`` is an *extra* status observer, chained after the metrics accumulator rather
+    than replacing it — the caller's logging must not cost the record its attempt count. It
+    exists because an export is otherwise silent for its whole duration, which for a
+    multi-hour chunk is indistinguishable from a hang.
     """
     t0 = time.monotonic()
     metrics.max_attempts = max_attempts
+
+    def _poll(status: dict) -> None:
+        metrics.note_poll(status)
+        if on_poll is not None:
+            on_poll(status)
     task = start_export(
         collection,
         extent,
@@ -440,7 +451,7 @@ def run_export(
             poll_interval=poll_interval,
             timeout=timeout,
             max_attempts=max_attempts,
-            on_poll=metrics.note_poll,
+            on_poll=_poll,
         )
     except BaseException:
         # A cancelled or failed export has usually already consumed EECU. Re-poll once so
