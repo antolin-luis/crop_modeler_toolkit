@@ -209,6 +209,11 @@ Rough shape, pending E2/E3:
 
 ## 6. Scaling scenarios
 
+> ⚠ **Redone 2026-07-31 on the chunked model.** The **113 EECU-h** LatAm figure below is
+> **obsolete** — not because the arithmetic was wrong, but because it prices an export that
+> **can no longer be submitted**. Superseded by §6.1. The table is kept because its
+> *egress* column and its land-cell counts remain correct and measured.
+
 Partially filled from E0 (§9.2). **Honduras is measured at 341 land cells**, not the ~150 originally guessed, so every multiplier below is revised.
 
 | Scenario | Land cells | Relative to Honduras | One-off EECU (46 yr × 7 vars) | Egress (46 yr × 7 vars) | Cost |
@@ -218,13 +223,77 @@ Partially filled from E0 (§9.2). **Honduras is measured at 341 land cells**, no
 | Mexico + CentAm | ~12–15k (est.) | ~40× | *unmeasured* | ~4–5 GB (est.) | ~$0.5 |
 | Latin America | **30,303** (measured, LSIB-clipped) | ~89× | **~113 EECU-h** (measured: 2.45/yr × 46) | **17.1 GB** (measured) | **$2.05** |
 
-**Both columns are now measured.** The LatAm EECU figure comes from the `bench-latam` calibration (2026-06-27): **2.45 EECU-h for one LatAm-year of all 7 variables over 30,303 land cells**, recorded in `docs/runbook.md` and confirmed by the project's own history. ×46 years → **~113 EECU-h ≈ 11% of one month's Contributor quota.** No year-splitting is needed for quota reasons.
+**Both columns were measured — but the EECU one has since expired.** The LatAm figure comes from the `bench-latam` calibration (2026-06-27): **2.45 EECU-h for one LatAm-year of all 7 variables over 30,303 land cells**, recorded in `docs/runbook.md`. ×46 years → ~113 EECU-h.
+
+⚠ **That measurement predates per-cell timezones (2026-07-23) and one-task-per-variable-year is now infeasible at this extent.** See §6.1: the real chunked figure is **487–966 EECU-h** for 46 years, and year-splitting *is* required — both for quota and for `max_map_length`. The egress column is unaffected.
 
 **The overhead effect, now quantified.** `eecu_per_unit` is **3.16e-8** EECU-h/cell-day at LatAm scale vs **2.61e-7** at Honduras scale — small extents are **8.3× worse per unit**, because fixed per-task cost is amortized over far fewer values. This is why extrapolating from a country-sized sample overstates the total:
 
 > ⚠ **Correction, 2026-07-30.** An earlier revision of this table projected **~1,840 EECU-h** for LatAm by scaling Honduras's rate up 175×, and concluded the backfill needed ~2 months of quota. That is **~16× too high**. It was written before the pre-existing 2.45 EECU-h/LatAm-year measurement was rediscovered, and it assumed ~50–65k land cells where the measured count is 30,303. The lesson is procedural, not arithmetic: **check `docs/runbook.md` and prior calibration notes before extrapolating** — the number already existed.
 
 **Read the multiplier column before the estimates.** LatAm is ~89× Honduras — not ~400× as originally guessed, and not the ~175× of the interim correction.
+
+---
+
+## 6.1 LatAm on the chunked model — REDONE 2026-07-31
+
+### Why the 113 EECU-h number had to be replaced
+
+`bench-latam` ran **2026-06-27**. Per-cell timezones landed **2026-07-23** (`7595819`). Before that commit a LatAm export was reduced against **one** timezone; today `build_daily_collection` mosaics **one clipped reduction per UTC offset in the extent**, and LatAm spans **7**.
+
+That is not a cost difference. It is a feasibility difference:
+
+| | cell-zones | vs ceiling 58,554 |
+|---|---|---|
+| LatAm unchunked, as measured in June (1 zone) | 30,362 | 0.5× — fine, and it ran |
+| LatAm unchunked, **today** (7 zones) | **212,534** | **3.6× OVER — EE would restart it indefinitely** |
+
+**So 113 EECU-h is the price of a run that cannot be repeated.** Chunking is not a tuning choice for this extent; it is the only way the backfill executes at all. And chunking changes the cost structure, because each task pays the fixed term of `0.0512 + 4.33e-5 × cells` (§9.4) and chunk boxes overhang the extent.
+
+### The extent
+
+No LatAm extent was ever written down — only "30,303 LSIB-clipped land cells". `[-56, -118, 33, -34]` (Mexico through Tierra del Fuego) holds **30,362** grid land cells across **7** zones, 0.2% from the measured count. That is the extent priced here; **record it, do not re-derive it.**
+
+### Two cost bases, because the fit does not extrapolate
+
+The per-task fit was built on chunk-scale exports (hundreds to ~20k cells). At LatAm's 30k cells it predicts **1.366** EECU-h/var-year where June actually measured **0.350** — the fit runs **3.9× high**, implying a marginal rate of `9.84e-6` rather than `4.33e-5`. Neither is authoritative at this scale, so every figure below is a **bracket**: measured-marginal (low) … fitted (high). Treat the truth as nearer the low end and the high end as the number to budget against.
+
+### Chunk size is now a cost lever, not only a safety one
+
+Per variable-year over LatAm:
+
+| `chunk_parents` | tasks | Σ export cells | overhang | ceiling margin | **46 yr × 7 vars (EECU-h)** |
+|---|---|---|---|---|---|
+| 225 | 27 | 39,182 | 1.29× | 5.82× | 569 … 991 |
+| **400** | **21** | **44,486** | **1.47×** | **3.17×** | **487 … 966** |
+| 900 | 11 | 52,185 | 1.72× | **1.05×** ⚠ | 347 … 909 |
+| 1600 | 8 | 52,218 | 1.72× | **0.91× — 1 chunk refused** ❌ | — |
+| 2500 | 6 | 42,452 | 1.40× | **1.00×** ⚠ | 233 … 691 |
+| 4900 | 6 | 127,111 | **4.19×** | 0.24× — 5 refused ❌ | — |
+
+**Take 400 anyway.** 2500 is genuinely ~2× cheaper, but its margin is **1.00×** — sitting exactly on a ceiling inferred from one failure, on an extent with 7 zones where Brazil had 4. 900 and 1600 are no better. The overhang column is the other trap: chunks are canonical grid blocks, so at 4900 you export **4.19× more cells than the extent contains** and the "savings" invert.
+
+### What it actually costs
+
+At `chunk_parents=400`, 21 tasks per variable-year:
+
+| Scope | tasks | EECU-h | share of one month's 1,000 quota |
+|---|---|---|---|
+| Full 1950–2026, 7 vars | 11,319 | 816 … 1,618 | 82% … **162%** |
+| 1950–2026, 5 vars (no wind) | 8,085 | 583 … 1,156 | 58% … 116% |
+| **1981–2026 (46 yr), 7 vars** | **6,762** | **487 … 966** | **49% … 97%** |
+| 1981–2026, 5 vars | 4,830 | 348 … 690 | 35% … 69% |
+| 2001–2026 (26 yr), 7 vars | 3,822 | 275 … 546 | 28% … 55% |
+
+Wall-clock at `gee_pool=4` (net 2.64×): **~11.8 days** for the 46-year × 7-variable option, ~19.8 days for the full 77-year one. Egress is unchanged and remains trivial — the §6 table's 17.1 GB / $2.05 still holds.
+
+### Recommendation
+
+**1981–2026 × 7 variables at `chunk_parents=400`, triggered in year windows across two calendar months.** 487–966 EECU-h fits inside one month at the low end and two at the high end, and the year-window trigger is forced anyway by `max_map_length` (§9.4).
+
+**Do not cut `wind_u`/`wind_v` to save the 29%.** They exist only to feed ET0, and FAO-56 Penman-Monteith has no wind-free form — dropping them does not degrade ET0, it **removes** it. For a DSSAT-facing dataset that is a functional amputation, not a saving. Cutting the start year costs early history that few crop-modeling use cases reach for; cutting wind costs a headline variable in every year. **Cut years, not variables.**
+
+The remaining honest uncertainty is the 2× spread between the two cost bases. It collapses cheaply: run **one** LatAm variable-year at 400 and read `eecu_hours` off the JSONL. That is ~3 EECU-h to remove the largest unknown in this section.
 
 ---
 
@@ -268,7 +337,7 @@ What each measurement would actually change — stated in advance, so the number
 |---|---|
 | ~~E1 egress for LatAm ERA5 > ~$100~~ | ✅ **Resolved by E0: $2.05 total.** Gate cannot fire; export path stays as-is |
 | ~~E1 compression ≥ 4×~~ | ✅ **Superseded.** Egress is settled in absolute terms, so the ratio no longer drives a decision |
-| ~~E1 `eecu_per_unit` vs Honduras~~ | ✅ **Resolved without E1**: the `bench-latam` calibration already measured 3.16e-8 at continental scale (8.3× better than Honduras). LatAm ≈ 113 EECU-h, comfortably inside one month. E1 is now confirmation, not discovery |
+| E1 `eecu_per_unit` vs Honduras | ⚠ **Partly reopened (§6.1).** `bench-latam` measured 3.16e-8 at continental scale (8.3× better than Honduras), but only for an unchunked task, which no longer runs at 7 zones. Chunked LatAm is **487–966 EECU-h — 49–97% of a month**, not "comfortably inside" it. The open piece is the marginal rate at chunk scale; one LatAm variable-year at 400 closes it |
 | **E1 `eecu_per_unit` materially above 3.16e-8** | The continental figure does not hold at intermediate extents — re-examine before scheduling a full backfill |
 | E2 GFS > ~25 EECU-h/day (≈750/month) | Reduce GFS variables or drop to once-daily. **Contributor tier is already in use — there is no tier left to upgrade to** |
 | E3 CHIRPS full history > ~500 EECU-h | Keep the 10-year default; make full backfill a documented opt-in with its own warning |
@@ -400,7 +469,7 @@ DELETE FROM wth_base
 | Sample | Date run | Extent | `N_s` (cell-days) | `E_s` (EECU-h) | `B_s` (GB) | Cost | Notes |
 |---|---|---|---|---|---|---|---|
 | E0-HN | 2026-07-23/24 | Honduras, 341 land cells, 1950–2026 × 7 vars (539 var-years) | 66,735,746 | **17.41** | 0.364 | $0.044 | 5.46 B/cell-day; **2.61e-7 EECU-h/cell-day**; per-task EECU 0.0170–0.0516 (**3× spread at constant work** → overhead-dominated) |
-| E0-LatAm | 2026-06-27 | LatAm, **30,303 land cells**, 1 yr × 7 vars | 77,636,286 | **2.45** (from `docs/runbook.md`; no longer in `listOperations`) | 0.371 | $0.045 | ×46 yr → **113 EECU-h**, 17.1 GB, $2.05. `eecu_per_unit` **3.16e-8**, `bytes_per_unit` **4.77** — vs Honduras 2.61e-7 / 5.46 |
+| E0-LatAm | 2026-06-27 | LatAm, **30,303 land cells**, 1 yr × 7 vars | 77,636,286 | **2.45** (from `docs/runbook.md`; no longer in `listOperations`) | 0.371 | $0.045 | ×46 yr → 113 EECU-h, 17.1 GB, $2.05. `eecu_per_unit` **3.16e-8**, `bytes_per_unit` **4.77** — vs Honduras 2.61e-7 / 5.46. ⚠ **Single-zone, unchunked — that path no longer exists at this extent (§6.1).** The egress figures stand; the EECU projection does not |
 
 `R_s`/`D_s` were not captured for E0 (silver holds Uruguay, not the `hn` root). They are not on the critical path: both scale with cells × days and neither has ever been the constraint.
 
@@ -538,11 +607,13 @@ Consequences:
 
 Also settled: **`gee_pool` = 4** (E1b, 2.64× net at p4 vs 3.10× at p8 for double the in-flight load).
 
-**Remaining strategic problem — quota, not throughput.** 778 EECU-h is 78% of one month's Contributor quota for **Brazil alone**. LatAm spans more cells and more zones, so it needs either several months of quota, a smaller variable set, or a shorter start year. That is now the binding constraint on scope, and §6's continental projection needs redoing on the chunked model before any LatAm commitment.
+**Remaining strategic problem — quota, not throughput.** 778 EECU-h is 78% of one month's Contributor quota for **Brazil alone**. That is the binding constraint on scope. ✅ **§6's continental projection has since been redone on the chunked model — see §6.1** (LatAm 46 yr × 7 vars = **487–966 EECU-h**; note that figure is *lower* than this Brazil number because it uses a bracketed marginal rate rather than the fitted one alone, and 46 years rather than 77).
 
 Two smaller notes from the run: exported `cells` differs from the grid's `land_cells` by a few per chunk (LSIB polygon clip vs the ERA5-Land-derived `is_land` mask — expected, not a bug), and `n_zones` was 1–3 per chunk against 4 for whole-Brazil, so chunking also cuts the per-band mosaic term.
 
 **This no longer blocks the cost model** — but it did change it. `eecu_per_unit` at continental scale was measured by `bench-latam` (3.16e-8 → ~113 EECU-h for the full backfill, §6) **with one task per variable-year**. §9.4 shows per-task EECU is dominated by a fixed ~0.035 EECU-h term, so splitting a variable-year into 21 chunks multiplies that term 21×: the same Brazil backfill costs ~715 EECU-h chunked. Wall-clock and EECU now trade directly against each other, and the 113 figure applies only to exports that are not split.
+
+⚠ **And "not split" is no longer an available option at continental scale.** Per-cell timezones (2026-07-23) took LatAm from 1 reduction zone to 7, putting an unchunked LatAm variable-year at 212,534 cell-zones — **3.6× over the ceiling**. Chunking is mandatory there, so the amortization that produced 3.16e-8 is unreachable by construction. §6.1 prices what is actually runnable.
 | E2 | | | | | | | | | |
 | E3 | | | | | | | | | |
 | C1 | | | | | | | | | |
@@ -565,7 +636,7 @@ Honest list of what this model cannot yet predict:
 5. **Autovacuum behaviour on a Pi** under daily 10⁷-row TRUNCATE+COPY cycles. → D1. **Still open** (deferred).
 6. **IRI Data Library rate limits** for the plume — no published figure known; treat as best-effort.
 7. ✅ **CLOSED — Contributor tier.** Already granted: 1,000 EECU-h/month. This also removes it as a *remedy*, since it can no longer be traded for headroom.
-8. ✅ **CLOSED — where the EECU curve flattens.** The `bench-latam` calibration measures 3.16e-8 EECU-h/cell-day at continental scale vs 2.61e-7 at Honduras scale (8.3× amortization), so LatAm is ~113 EECU-h. Only the *intermediate* shape of the curve is unsampled, and nothing depends on it. Briefly the "dominant open unknown" in this document because a pre-existing measurement was overlooked.
+8. ⚠ **REOPENED 2026-07-31 — the EECU curve under chunking.** `bench-latam` measured 3.16e-8 EECU-h/cell-day at continental scale vs 2.61e-7 at Honduras (8.3× amortization) → ~113 EECU-h for LatAm. That amortization **only exists for one task per variable-year**, which per-cell timezones made infeasible at this extent (§6.1). Chunked, the same backfill is 487–966 EECU-h. What remains genuinely unknown is the **marginal rate at chunk scale**: the §9.4 fit says 4.33e-5 EECU-h/cell, the June measurement implies 9.84e-6, and the 4.4× gap is the whole width of the estimate. **Closable for ~3 EECU-h**: one LatAm variable-year at `chunk_parents=400`.
 9. **⚠ NEW — large-extent export wall-clock.** A Brazil-sized variable-year does not complete in a workable time as a single 366-band export task (§9.3). This blocks E1 and, by extension, any continental backfill — independently of cost, which is settled. Being addressed in a dedicated session on efficient large-extent downloads.
 10. **⚠ NEW — Pi hardware stability.** Three unexplained hard freezes in two days (2026-07-29 10:30, 2026-07-30 03:03, 2026-07-30 14:28), no OOM / thermal / under-voltage / PCIe trace in any journal. Unattended multi-hour runs are unreliable until this is understood. Bronze is idempotent per `(variable, year)`, so a freeze costs at most one variable-year on resume — but a *hard* freeze writes no metrics record at all, so interrupted samples must be re-run into a fresh `data_root`.
 
@@ -577,7 +648,7 @@ Rewritten 2026-07-30, after E0 replaced the estimates with measurements.
 
 - **Nothing here costs meaningful money.** The full 46-year Latin America ERA5 backfill egresses **17.1 GB ≈ $2.05**. The complete Honduras archive that already exists cost **$0.044**. EECU is quota-limited, not billed; CDS and every HTTP source are free; the Pi is sunk cost.
 - **§2's $1,700 egress risk was a unit error** (28 GB written as 28 TB), and the mitigations it motivated — `int16`, `toDrive`, direct-download — are all withdrawn. This document's most valuable output so far is the deletion of its own headline finding.
-- **EECU is settled too.** The LatAm 46-year backfill is **~113 EECU-h** — 11% of one month's Contributor quota — measured, not extrapolated. Small extents are 8.3× worse per unit because fixed per-task cost dominates; that is a reason to prefer *fewer, larger* jobs, not a constraint on the total.
+- **EECU is the binding constraint, and it is not settled — it is bounded.** The LatAm 46-year × 7-variable backfill is **487–966 EECU-h at `chunk_parents=400`** (§6.1), i.e. **49–97% of one month's Contributor quota**, not the 11% an earlier revision claimed. The old ~113 EECU-h figure priced a single unchunked task per variable-year, which at 7 timezone zones is now **3.6× over the export ceiling** and cannot be submitted. Small extents remain 8.3× worse per unit, but "prefer fewer, larger jobs" is now capped by the ceiling rather than open-ended. One LatAm variable-year at 400 (~3 EECU-h) would collapse the remaining 2× spread.
 - **The one genuinely open item is export wall-clock at scale** (§9.3), which is a throughput problem, not a cost or quota one.
 - **The one real scheduling exposure remains GFS's recurring monthly EECU**, because unlike a backfill it cannot be split across months. Quota is 1,000 EECU-h/month and Contributor tier is already in use, so there is no upgrade left as a remedy. → E2.
 - **Method note worth carrying forward:** E0 cost nothing. Object metadata, Parquet row counts, and `ee.data.listOperations()` answered at country and continental scale what was scheduled as an hour of paid runs. On any project with history, mine it before you measure it — but mine it *early*, since EE retains operations only about a week.
