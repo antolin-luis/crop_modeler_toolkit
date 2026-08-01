@@ -113,7 +113,9 @@ So: **each new source confirms its own budget with one probe export at the targe
     gadm_<iso3>.parquet                         # static
 ```
 
-**Manifest.** Extend `src/cds/manifest.py` rather than writing a second one — it already does atomic writes and two-granularity tracking. Generalize the key from `(variable, year)` to `(source, variable, chunk_key)`. The existing ERA5 keys must keep working; add the new form beside them, do not migrate.
+**Manifest.** Extend `src/cds/manifest.py` rather than writing a second one. As of 2026-07-31 it already does atomic writes, **cross-process-safe mutations** (exclusive `flock`, re-reading inside the lock) and **three** granularities: `(variable, year)`, time sub-chunks `start/end`, and spatial chunks `sp:<chunk_id>`. Generalize the key from `(variable, year)` to `(source, variable, chunk_key)`. The existing ERA5 keys **and** the `sp:` keyspace must keep working; add the new form beside them, do not migrate.
+
+⚠ **Do not re-solve the concurrency.** The `flock` is there because concurrent Airflow task *processes* silently lost each other's marks (`plan_gee_chunked_backfill.md` §9.1). Any new mutator must go through `Manifest._exclusive()`; a `threading.Lock` is **not** sufficient — the writers are processes, not threads.
 
 **Retention.** Bronze forecast issuances accumulate forever by default. At ~200 KB per SEAS5 issuance this is irrelevant; at GFS's 4-runs-a-day it is not. Add a `retain_issuances` DAG param (default: keep all for SEAS5/NMME, keep 30 days for GFS).
 
@@ -393,6 +395,17 @@ src/
 
 Reuse, do not reimplement: `src/db/load.py::copy_csv` and `connect`, `src/cds/client.py`, `src/gee/client.py` + `export.py`, `src/cds/manifest.py`, `src/grid/encoding.py`.
 
+**A GEE-backed phase (6, 9, 13) additionally reuses, and must not rebuild:**
+
+| Module | What it already gives you |
+|---|---|
+| `src/gee/chunks.py` | `plan_chunks(extent, parents_per_side)` → land-bearing chunks with the ceiling guard applied; `tile_extent`, `side_of`, `CELL_ZONE_CEILING` |
+| `src/db/grid_query.py` | `chunk_land_stats` → land cells + tz zones per chunk, straight from the grid, no EE call |
+| `src/gee/export.py` | `wait_for_task(max_attempts=…, on_poll=…)` — the attempt cap and the progress hook |
+| `src/gee/metrics.py` | schema-v2 cost records (`attempts`, `chunk_id`, `n_zones`, EECU, egress) via `run_export` |
+| `src/transform/merge.py` | `var_year_paths` — **glob, never an exact filename**, or chunked output is silently invisible |
+| `airflow/dags/download_bronze_gee.py` | the reference wiring: `_plan` over `(year, variable, chunk)`, `_rebuild_chunk`, `_rollup`, the `max_map_length` guard |
+
 ---
 
 ## 7. DAGs
@@ -433,8 +446,8 @@ Four stages. Each phase lists deliverable, tests, and an acceptance criterion th
 
 **Phase 0 — Scaffolding**
 - `src/db/context_schema.sql` with all tables from §5; `src/db/context_load.py`; `build_context_base` DAG skeleton; `context_pool`.
-- Extend `src/cds/manifest.py` keys to `(source, variable, chunk)` **without breaking existing ERA5 keys**.
-- *Tests:* `test_context_schema.py` (DDL applies to a clean DB and is idempotent), `test_manifest.py` extended (old ERA5 keys still resolve).
+- Extend `src/cds/manifest.py` keys to `(source, variable, chunk)` **without breaking existing ERA5 keys or the `sp:` spatial keyspace** (§4).
+- *Tests:* `test_context_schema.py` (DDL applies to a clean DB and is idempotent), `test_manifest.py` extended (old ERA5 keys still resolve; `sp:` keys still resolve; the existing multi-process no-lost-marks test still passes).
 - *Accept:* `docker compose up` on an existing volume creates every new table, and a re-run of `download_bronze` still skips already-done ERA5 variable-years.
 
 **Phase 1 — `wth_normals`**
@@ -594,4 +607,4 @@ Per `CLAUDE.md`'s plan-driven workflow: branch first, code on the branch, stop f
 
 Recommended first branch: **`context-phase0-1-normals`** — Phase 0 scaffolding plus Phase 1 `wth_normals`. It touches no external API, needs no new credentials, is fully testable offline against the existing `wth_base`, and unlocks every anomaly-based product downstream. If something in the schema design is wrong, this is the cheapest phase in which to discover it. It also touches no GEE at all, so nothing in §3.4 blocks it.
 
-Phases 6 and 9 are the ones that do: they must not start before the chunked-export work lands on `download_bronze_gee` (`docs/plan_gee_chunked_backfill.md` Part A), or they will re-invent chunking with a different, unmeasured ceiling.
+Phases 6 and 9 were previously blocked on the chunked-export work. **That landed on 2026-07-31** (`docs/plan_gee_chunked_backfill.md`, merged via PR #9 + #10) — so they are unblocked, and they must *use* `src.gee.chunks.plan_chunks` rather than re-invent chunking with a different, unmeasured ceiling.

@@ -1,6 +1,13 @@
 # Implementation Plan — Chunked GEE Backfill (production wiring)
 
-**Status:** plan only. No code written for Part A. Part 0 below is already built and awaiting commit on branch `gee-chunk-probe`.
+**Status: ✅ DONE — Part 0, Part A and Part B all merged to `main` on 2026-07-31.**
+PR #9 (`376501d`, the probe) and PR #10 (`f33ac0c`, merge `f5f8129`, production wiring + docs).
+Both branches deleted. 227 tests green on merged `main`.
+
+**Do not re-implement any of this.** What is described below as "to change" is already in the
+code. The one thing still open is the scope decision in §6, which is a call for the user to
+make, not work to do. See §9 for what the live run actually measured and the two defects it
+caught.
 
 **Companion:** [`cost_model_climate_context.md`](cost_model_climate_context.md) §9.3–9.4 is the evidence — *what was measured and why*. This document is *what to change and in what order*.
 
@@ -164,7 +171,7 @@ The budget table costs rows and disk but **not EECU**, which is now the binding 
 
 ### B6. §13 first branch — unchanged
 
-`context-phase0-1-normals` is still the right first branch: it touches no GEE at all. Note only that Phase 6/9 must not start before Part A lands, since they would otherwise re-invent chunking.
+`context-phase0-1-normals` is still the right first branch: it touches no GEE at all. Phase 6/9 were gated on Part A, which has now landed — they are unblocked and must *use* `plan_chunks` rather than re-invent chunking.
 
 ---
 
@@ -192,10 +199,36 @@ The budget table costs rows and disk but **not EECU**, which is now the binding 
 
 ---
 
-## 8. Workflow
+## 8. Workflow — completed as planned
 
-Per `CLAUDE.md`: branch first, code on the branch, stop for user testing, wait for explicit authorization before commit/PR/merge.
+Part 0 → PR #9. Part A (A0 → A1 → A2 → A3 → A4 → A5 → A6) + Part B → PR #10, both merged 2026-07-31.
 
-- Commit/PR `gee-chunk-probe` **before** starting Part A.
-- Part A branch: **`gee-chunked-dag`**. Order: A0 → **A1 (the silent-failure fix, first)** → A2 → A3 → A4 → A5 → A6.
-- Part B is documentation-only and can ride the same branch or a separate `docs/context-plan-chunking` — it changes no code.
+---
+
+## 9. What the live run measured (2026-07-31)
+
+Trigger: `download_bronze_gee`, Brazil extent, 2020, `tmin`, `chunk_parents=400`.
+
+| Result | Value |
+|---|---|
+| Chunks | 8, **`attempts=1` on every one** — the failure this work exists to prevent did not occur |
+| Cost | 1.23 EECU-h, 7.7 M bronze rows, 4 concurrent at `gee_pool=4` |
+| Silver | **9,120,720 rows = 24,920 cells × 366 days exactly**, zero duplicate `(child_id, date)` |
+| Predictor accuracy | grid predicted 4,024 land cells where EE exported 4,051 (0.7%, LSIB clip vs grid `is_land`); `land_parents` matched exactly on all 8 |
+| Zones | 2–3 per chunk vs 4 for the whole extent |
+| Resume | re-trigger of identical conf: 2 min vs 36, **zero exports submitted**, `rollup` closed the var-year |
+| Ceiling margin | worst chunk `cell_zones=12,072` → **4.85×** under 58,554 |
+
+### 9.1 ⚠ Two defects the live run caught that 225 passing tests did not
+
+Both are fixed and merged; they are recorded because the *class* of bug will recur.
+
+1. **Silver could not see chunked bronze.** `transform.var_year_path` resolved exactly one file per var-year, so `<var>_<year>__<chunk_id>.parquet` was **silently** not found — `available_variables` reported the variable absent and `transform_silver` produced nothing. Now `var_year_paths` globs. *Any future code that resolves a bronze path by exact filename has this bug.*
+
+2. **The manifest lost marks across processes.** `Manifest` snapshots the JSON at construction and rewrites the whole file per mark, so the concurrent task **processes** `gee_pool=4` allows raced: 3 of 7 marks survived, then 2. Mutations now take an exclusive `flock` and re-read *inside* it. The probe never hit this — one process, and its `threading.Lock` covers threads only. *A lost mark means re-exporting work that already landed, spending the quota the manifest protects.*
+
+The lesson worth carrying: **a chunked path must be smoke-run end-to-end.** Neither defect was reachable from the unit suite, and the first one fails silently rather than loudly.
+
+### 9.2 Still open — a scope call, not work
+
+§6's continental decision. §6 of the cost model still projects LatAm on the *unchunked* model and needs redoing on `0.0512 + 4.33e-5 × cells` first.
