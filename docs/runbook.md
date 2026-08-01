@@ -135,8 +135,16 @@ Both DAGs share these parameters:
 - **CDS (`download_bronze`) keeps a single `timezone`** applied to the whole extent —
   correct only for a single-timezone extent; split a multi-tz extent into one run per zone.
 
-GEE adds `land_only` (default `True`, clips to land via LSIB) and `chunk_days`
-(default 30 — lower it if the Pi runs short on memory).
+GEE adds `land_only` (default `True`, clips to land via LSIB), `chunk_days`
+(default 30 — lower it if the Pi runs short on memory), and the chunking params:
+
+| Param | Default | Meaning |
+|---|---|---|
+| `chunk_parents` | `400` | Parents per export chunk — 400 is a 20°×20° block. `0` exports the whole extent in one task. Must be a perfect square. |
+| `max_attempts` | `2` | EE restarts tolerated before the export is abandoned |
+| `skip_over_ceiling` | `true` | Fail the plan rather than submit an export the grid predicts will be restarted |
+
+See §3.1 below before running anything larger than a country.
 
 ### Trigger it
 
@@ -156,10 +164,13 @@ For the CDS backend use `download_bronze` and add `"timezone":"UTC-03:00"`.
 > **Always pass an extent.** The default is the whole globe. A global backfill is not
 > what you want as a first run.
 
-Tasks are mapped one per `(year, variable)`, year-major, and bound to a pool
-(`cds_pool` / `gee_pool`, both capped at 2) so neither service gets hammered.
+CDS tasks are mapped one per `(year, variable)`; GEE tasks one per `(year, variable, chunk)`.
+Both bind to a pool so neither service gets hammered — `cds_pool` at **2**, `gee_pool` at
+**4** (measured: four in-flight exports are a net 2.64× over serial; 8 buys only 3.10× for
+double the load, and EE throttles to ~4.4 running regardless).
+
 Both DAGs are **idempotent** via a shared manifest — a `(variable, year)` completed by
-*either* backend is skipped on re-run.
+*either* backend is skipped on re-run, and a chunked run skips per chunk.
 
 ### Check the result
 
@@ -172,6 +183,74 @@ print(d.shape); print(d.head()); print(d.date.nunique(), 'days,', d.child_id.nun
 
 Expect `child_id, parent_id, date, value`, one row per cell per day, values in Kelvin
 (~250–320 for `tmax`). A land-clipped Uruguay year is 412 cells × 366 days = 150,792 rows.
+
+### 3.1 Chunked backfill (extents bigger than a country)
+
+**One export of a whole year over a continental extent does not complete.** EE restarts the
+task (`attempt` 2, 3) until something cancels it — measured twice over Brazil, the second
+time under an attempt cap that cut the loss at 55 minutes. The predictor is
+`land_cells × zones`: every export at or below **58,554** completed on the first attempt; the
+whole-Brazil extent at ~90,748 never did. Both terms come from `era5_land_base_grid`, so the
+plan refuses a doomed export before EE is called.
+
+`chunk_parents=400` (the default) splits the extent into 20°×20° blocks, one export each,
+4.9× under that ceiling. Ocean-only blocks are dropped.
+
+```bash
+docker compose run --rm airflow-scheduler \
+  airflow dags trigger download_bronze_gee \
+  -c '{"extent":[-34,-74,5.5,-34.75],"start_year":2020,"end_year":2020,
+       "chunk_parents":400,"data_root":"/data/br"}'
+```
+
+**Trigger in year windows.** Airflow refuses to expand a mapped task beyond
+`core.max_map_length` (default 1024). Brazil at 400 parents is 8 chunks, so a full
+1950–2026 × 7-variable backfill is 4,312 tasks — the `plan` task fails naming the window
+that would fit (18 years, at 56 tasks per year). Windowing is what you want anyway:
+**778 EECU-h for Brazil alone is 78% of one month's Contributor quota**, so the backfill has
+to be spread across months regardless.
+
+**Reading the result.** Each chunk writes `<var>/<var>_<year>__<chunk_id>.parquet` and one
+record in `<bronze>/_gee_metrics.jsonl`. The field to watch is `attempts`:
+
+```bash
+uv run python -c "
+import json
+for line in open('.localdata/br/bronze/_gee_metrics.jsonl'):
+    r = json.loads(line)
+    if (r.get('attempts') or 1) > 1 or r.get('error'):
+        print(r['chunk_id'], r.get('attempts'), r.get('n_zones'), r.get('error'))"
+```
+
+`attempts=1` everywhere is a healthy run. Anything higher means that chunk is at the edge of
+what one EE task can do.
+
+**When a chunk trips the ceiling.** The `plan` task fails naming the worst chunk and its
+`cell_zones`. Drop `chunk_parents` to the next size down for that extent — **225, then
+100** — and re-trigger. Do not raise `max_attempts`, and do not use the probe's `--force`:
+both just spend more quota arriving at the same failure. The ceiling is also
+**band-count-specific** (measured at 366 daily bands), so a future 16-band GFS or 36-band
+NDVI export needs its own probe run, not this number.
+
+**The chunk boxes overhang the extent, on purpose.** Chunks are canonical grid blocks, not
+clipped to the request — that is what keeps `chunk_id` a pure function of position so a later,
+differently-shaped run can skip work already done. A chunked backfill therefore covers
+slightly more ground than `extent` asked for, and those extra land cells reach silver. Not a
+bug: they are grid-aligned, land-only, and upserted like any other cell.
+
+**Resuming.** Interrupt and re-trigger the same conf: chunks already marked short-circuit on
+the manifest with no export submitted. The `rollup` task closes a `(variable, year)` in the
+manifest once all of its chunks are marked, and logs which are still missing otherwise.
+
+**Resizing the pool on an already-running stack.** `airflow pools set` overwrites, so
+`airflow-init` does resize `gee_pool` 2 → 4 — but only when it re-runs. A stack that is
+already up keeps the old size until then. To apply it without a restart:
+
+```bash
+docker compose run --rm airflow-scheduler airflow pools set gee_pool 4 "GEE export cap"
+```
+
+Or Admin → Pools in the UI.
 
 ---
 

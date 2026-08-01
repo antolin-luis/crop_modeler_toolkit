@@ -15,13 +15,26 @@ Two granularities are tracked:
 
 Writes are atomic (temp file + ``os.replace``) and a missing or corrupt file is treated
 as empty, so a crash mid-write never corrupts the manifest.
+
+**Marks are also atomic across processes.** The whole file is rewritten on every mark, so a
+read-modify-write from an in-memory snapshot loses any mark another writer landed in the
+meantime. That is not hypothetical: the GEE backend runs up to ``gee_pool`` chunk exports as
+separate Airflow task *processes*, and a chunked smoke run marked 3 of 7 completed chunks —
+the other 4 were overwritten. Every mutation therefore takes an exclusive ``flock`` and
+re-reads the file inside it (:meth:`Manifest._exclusive`).
+
+``flock`` coordinates processes on **one host**, which is what a LocalExecutor deployment is.
+A multi-host executor sharing a manifest over NFS would need a real lock service; nothing in
+this project does that.
 """
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import tempfile
+from contextlib import contextmanager
 from pathlib import Path
 
 _FILENAME = "_manifest.json"
@@ -40,10 +53,19 @@ def _spatial_key(chunk_id: str) -> str:
 
 
 class Manifest:
-    """On-disk record of completed downloads. Not thread-safe; one writer at a time."""
+    """On-disk record of completed downloads.
+
+    Reads are served from a snapshot taken at construction; mutations re-read under an
+    exclusive lock (see the module docstring), so concurrent writers cannot lose each
+    other's marks. Call :meth:`refresh` to pick up marks landed by another process since.
+    """
 
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
+        self._data = self._read()
+
+    def refresh(self) -> None:
+        """Re-read the file, adopting marks other processes have landed since."""
         self._data = self._read()
 
     @classmethod
@@ -72,6 +94,28 @@ class Manifest:
             Path(tmp).unlink(missing_ok=True)
             raise
 
+    @contextmanager
+    def _exclusive(self):
+        """Hold an exclusive lock, re-read, let the caller mutate, then write.
+
+        The lock lives on a sidecar ``.lock`` file rather than the manifest itself: the
+        manifest is replaced by ``os.replace`` on every write, so a lock held on it would
+        be a lock on an unlinked inode the moment anyone wrote.
+
+        Re-reading *inside* the lock is the load-bearing part. Locking the write alone
+        would still serialise two writers around their own stale snapshots.
+        """
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path = self.path.with_name(self.path.name + ".lock")
+        with open(lock_path, "a+") as handle:
+            fcntl.flock(handle, fcntl.LOCK_EX)
+            try:
+                self._data = self._read()
+                yield
+                self._write()
+            finally:
+                fcntl.flock(handle, fcntl.LOCK_UN)
+
     def _entry(self, variable: str, year: int) -> dict:
         return self._data["var_years"].setdefault(
             _vy_key(variable, year), {"done": False, "chunks": []}
@@ -83,8 +127,8 @@ class Manifest:
         return bool(entry and entry.get("done"))
 
     def mark_var_year_done(self, variable: str, year: int) -> None:
-        self._entry(variable, year)["done"] = True
-        self._write()
+        with self._exclusive():
+            self._entry(variable, year)["done"] = True
 
     # --- time sub-chunks --------------------------------------------------------
     def is_chunk_done(self, variable: str, year: int, start: str, end: str) -> bool:
@@ -92,12 +136,12 @@ class Manifest:
         return bool(entry and _chunk_key(start, end) in entry.get("chunks", []))
 
     def mark_chunk_done(self, variable: str, year: int, start: str, end: str) -> None:
-        chunks = self._entry(variable, year)["chunks"]
-        key = _chunk_key(start, end)
-        if key not in chunks:
-            chunks.append(key)
-            chunks.sort()
-            self._write()
+        with self._exclusive():
+            chunks = self._entry(variable, year)["chunks"]
+            key = _chunk_key(start, end)
+            if key not in chunks:
+                chunks.append(key)
+                chunks.sort()
 
     # --- spatial sub-chunks -----------------------------------------------------
     # The GEE backend splits a variable-year by *area* as well (src/gee/chunks.py), and
@@ -110,9 +154,9 @@ class Manifest:
         return bool(entry and _spatial_key(chunk_id) in entry.get("chunks", []))
 
     def mark_spatial_chunk_done(self, variable: str, year: int, chunk_id: str) -> None:
-        chunks = self._entry(variable, year)["chunks"]
-        key = _spatial_key(chunk_id)
-        if key not in chunks:
-            chunks.append(key)
-            chunks.sort()
-            self._write()
+        with self._exclusive():
+            chunks = self._entry(variable, year)["chunks"]
+            key = _spatial_key(chunk_id)
+            if key not in chunks:
+                chunks.append(key)
+                chunks.sort()

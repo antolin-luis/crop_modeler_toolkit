@@ -9,7 +9,15 @@ from __future__ import annotations
 
 import pytest
 
-from src.gee.chunks import Chunk, chunk_id, tile_extent
+from src.gee.chunks import (
+    CELL_ZONE_CEILING,
+    Chunk,
+    PlannedChunk,
+    chunk_id,
+    plan_chunks,
+    side_of,
+    tile_extent,
+)
 from src.grid.encoding import cell_code, parent_bbox, parent_code, parent_code_bbox
 from src.grid.spec import NLAT, NLON, RESOLUTION
 
@@ -172,3 +180,98 @@ def test_chunk_is_hashable_and_frozen():
     assert isinstance(chunk, Chunk)
     with pytest.raises(Exception):
         chunk.chunk_id = "nope"  # type: ignore[misc]
+
+
+# --- planning: land filter and the ceiling guard -----------------------------------
+def _fake_stats(monkeypatch, by_chunk: dict[str, tuple[int, int, int]]):
+    """Stub ``chunk_land_stats`` so planning is testable without Postgres.
+
+    ``by_chunk`` maps ``chunk_id -> (land_parents, land_cells, zones)``; anything absent
+    is an ocean-only chunk. Patched on ``src.db.grid_query`` because ``plan_chunks``
+    imports it lazily, at call time, from that module.
+    """
+    import src.db.grid_query as grid_query
+
+    def _stub(chunks, *, conn=None):
+        return {
+            c.chunk_id: grid_query.ChunkStats(*by_chunk.get(c.chunk_id, (0, 0, 0)))
+            for c in chunks
+        }
+
+    monkeypatch.setattr(grid_query, "chunk_land_stats", _stub)
+
+
+def test_side_of_rejects_non_square_sizes():
+    assert side_of(400) == 20
+    assert side_of(1) == 1
+    with pytest.raises(ValueError, match="perfect square"):
+        side_of(500)
+
+
+def test_plan_chunks_drops_ocean_only_chunks(monkeypatch):
+    """An ocean-only chunk is a whole EE task for a GeoTIFF with no valid pixel."""
+    all_ids = [c.chunk_id for c in tile_extent(BRAZIL, 20)]
+    _fake_stats(monkeypatch, {all_ids[0]: (7, 5_000, 2)})
+
+    plans = plan_chunks(BRAZIL, 20)
+
+    assert [p.chunk_id for p in plans] == [all_ids[0]]
+    assert plans[0].land_parents == 7
+
+
+def test_plan_chunks_keeps_canonical_tile_order(monkeypatch):
+    """Resumed runs must cover the extent in the same order as the first one."""
+    ordered = [c.chunk_id for c in tile_extent(BRAZIL, 10)]
+    _fake_stats(monkeypatch, {cid: (1, 100, 1) for cid in ordered})
+
+    assert [p.chunk_id for p in plan_chunks(BRAZIL, 10)] == ordered
+
+
+def test_over_ceiling_splits_on_the_product_not_either_term(monkeypatch):
+    """Neither cells nor zones alone separates the measured cases — only their product."""
+    ids = [c.chunk_id for c in tile_extent(BRAZIL, 20)]
+    _fake_stats(
+        monkeypatch,
+        {
+            ids[0]: (400, 19_518, 3),  # 58,554 — the largest export observed to complete
+            ids[1]: (400, 19_519, 3),  # one cell more
+            ids[2]: (400, 22_687, 4),  # ~90,748 — the whole-Brazil failure
+            ids[3]: (400, 5_000, 4),   # 4 zones, but small: fine
+        },
+    )
+
+    plans = {p.chunk_id: p for p in plan_chunks(BRAZIL, 20)}
+
+    assert plans[ids[0]].cell_zones == CELL_ZONE_CEILING
+    assert not plans[ids[0]].over_ceiling
+    assert plans[ids[1]].over_ceiling
+    assert plans[ids[2]].over_ceiling
+    assert not plans[ids[3]].over_ceiling
+
+
+def test_zoneless_chunk_counts_cells_once():
+    """``zones=0`` means "not measured", not "zero work" — it must not zero the product."""
+    plan = PlannedChunk(chunk=tile_extent(BRAZIL, 10)[0], land_parents=1, land_cells=900)
+    assert plan.cell_zones == 900
+
+
+def test_chunk_box_retiles_to_exactly_itself():
+    """The DAG ships a chunk's box, not its 400 parent codes, and rebuilds the chunk.
+
+    ``download_bronze_gee._rebuild_chunk`` depends on this: re-tiling a chunk's own box at
+    the same size must yield that one chunk, parent codes included. It holds because chunk
+    boxes are canonical grid blocks rather than clipped to a request.
+    """
+    for extent, k in [(BRAZIL, 20), (BRAZIL, 10), ([-90.0, -180.0, 90.0, 180.0], 20)]:
+        for chunk in tile_extent(extent, k):
+            again = tile_extent(chunk.extent, k)
+            assert len(again) == 1, f"{chunk.chunk_id} re-tiled to {len(again)} chunks"
+            assert again[0] == chunk
+
+
+def test_no_db_planning_measures_nothing_and_flags_nothing():
+    """``use_db=False`` must not reach Postgres, drop chunks, or claim a chunk is safe."""
+    plans = plan_chunks([-34.0, -74.0, 5.5, -34.75], 20, use_db=False)
+
+    assert len(plans) == len(tile_extent(BRAZIL, 20))
+    assert all(p.land_cells == 0 and not p.over_ceiling for p in plans)

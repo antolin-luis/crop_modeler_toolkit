@@ -57,6 +57,7 @@ def download_variable_year(
     land_parents: int | None = None,
     max_attempts: int | None = None,
     parallel: int | None = None,
+    on_poll=None,
 ) -> Path:
     """Download one ``(variable, year)`` to ``bronze/<var>/<var>_<year>.parquet``.
 
@@ -83,7 +84,9 @@ def download_variable_year(
     rather than the year, so the year is only "done" once its caller says every part is in.
     ``max_attempts`` aborts the export when EE restarts it more than that many times, which
     is the signal that the chunk is still too big. ``land_parents``/``parallel`` are pure
-    metrics context, recorded so a size ladder can be read back off the JSONL.
+    metrics context, recorded so a size ladder can be read back off the JSONL. ``on_poll``
+    observes every EE status dict, for callers that want to log progress across an export
+    long enough that silence would look like a hang.
     """
     if chunk is not None:
         extent = list(chunk.extent)
@@ -138,6 +141,7 @@ def download_variable_year(
                 metrics=m,
                 land_only=land_only,
                 max_attempts=max_attempts,
+                on_poll=on_poll,
             )
             t_encode = time.monotonic()
             try:
