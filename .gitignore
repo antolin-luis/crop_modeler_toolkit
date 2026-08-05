@@ -39,3 +39,9 @@ __pycache__/
 combined-with-oceans.json
 tz-oceans.zip
 tz_by_offset.*
+
+# Third-party reference bulletins (CENAOS/COPECO and similar) — kept locally for
+# layout reference, never redistributed. The API's own reports must be generated,
+# not derived from these PDFs.
+Perspectiva*.pdf
+*BOLETIN*.pdf
