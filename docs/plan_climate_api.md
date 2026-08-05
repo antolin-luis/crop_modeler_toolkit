@@ -9,8 +9,10 @@ endpoints, API keys with rate limits, async exports, and automated PDF reports �
 hosted in the cloud. Includes the pipeline work that must land first, the cloud
 migration, and a costed estimate in dev-days and dollars.
 
-**Companion:** the executive one-pagers (`Honduras_Climate_API_Onepager*.docx`, EN/ES/PT
-at the repo root) are the TLDR of Part 1. This document is the full plan.
+**Companion:** the executive one-pagers (`Honduras_Climate_API_Onepager*.docx` at the
+repo root — English, Spanish and Brazilian Portuguese) are the TLDR of Part 1. This
+document is the full plan. Regenerate all three with
+`uv run --with python-docx python scripts/make_onepager.py`.
 
 **Reference artifacts:**
 - `Perspectiva Ago_Nov 2026.pdf` (repo root) — the CENAOS/COPECO seasonal bulletin the

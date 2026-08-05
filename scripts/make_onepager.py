@@ -221,8 +221,10 @@ T["es"] = dict(
              0)],
 )
 
+# Brazilian Portuguese (pt-BR): arquivos/registros/umidade/grade/fazenda/
+# hospedagem/requisições/sob demanda — not pt-PT.
 T["pt"] = dict(
-    out="Honduras_Climate_API_Onepager_PT.docx",
+    out="Honduras_Climate_API_Onepager_PT_BR.docx",
     title="API de Dados Climáticos de Honduras",
     subtitle="De uma base de dados pronta a um produto vendável em três meses",
     intro="Setenta e seis anos de dados climáticos diários de toda Honduras já estão "
@@ -258,8 +260,8 @@ T["pt"] = dict(
             "um município ou o país inteiro — junto com o que quer saber, e recebe "
             "dados ou um documento pronto. ", 0),
            ("60 serviços atrás de uma única chave de API", 1),
-           (": histórico diário desde 1950; normais climatológicas e o quanto a safra "
-            "atual se afasta delas; indicadores de seca, graus-dia e água para a "
+           (": histórico diário desde 1950; normais climatológicas e o quanto a "
+            "temporada atual se afasta delas; indicadores de seca, graus-dia e água para a "
             "cultura; exposição a furacões; previsões sazonais; arquivos prontos para "
             "o modelo de culturas DSSAT; e ", 0),
            ("relatórios PDF automáticos", 1),
