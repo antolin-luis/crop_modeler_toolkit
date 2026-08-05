@@ -27,6 +27,7 @@ BAND = "EAF2F5"
 T = {}
 
 T["en"] = dict(
+    scale=1.00,
     out="Honduras_Climate_API_Onepager.docx",
     title="Honduras Climate Data API",
     subtitle="From a finished dataset to a sellable product in three months",
@@ -60,7 +61,7 @@ T["en"] = dict(
     built=[("A commercial web service. A customer sends a location — a farm, a "
             "municipality, or the whole country — plus what they want to know, and "
             "receives either data or a finished document. ", 0),
-           ("60 services behind one API key", 1),
+           ("61 services behind one API key", 1),
            (": daily history back to 1950; climate normals and how far the current "
             "season departs from them; drought, growing-degree and crop-water "
             "indicators; hurricane exposure; seasonal forecasts; ready-to-run DSSAT "
@@ -74,23 +75,23 @@ T["en"] = dict(
     assume=[("One developer working with AI assistance, ", 0),
             ("six focused hours per day, five days per week", 1),
             (", starting 1 September 2026.", 0)],
-    cols=("Milestone", "Days", "Date", "What can be sold"),
+    cols=("Milestone", "Days", "Services", "Date", "What can be sold"),
     rows=[
-        ("Monthly PDF report", "0", "AVAILABLE NOW",
+        ("Monthly PDF report", "0", "0", "AVAILABLE NOW",
          "Branded monthly agroclimatic bulletin, sold as a subscription today"),
-        ("First live service", "20", "29 Sep 2026",
+        ("First live service", "20", "6", "29 Sep 2026",
          "One secured endpoint, live on the internet"),
-        ("Sellable product", "60", "24 Nov 2026",
+        ("Sellable product", "60", "32", "24 Nov 2026",
          "History, normals, anomalies, drought indicators, crop files, bulk export"),
-        ("Reports behind the API", "68", "5 Dec 2026",
+        ("Reports behind the API", "68", "40", "5 Dec 2026",
          "Self-serve per-farm and per-department reports on demand"),
-        ("Hazard and drought", "82", "24 Dec 2026",
+        ("Hazard and drought", "82", "53", "24 Dec 2026",
          "Hurricane exposure, municipal drought alerts"),
-        ("Seasonal forecasts", "103", "23 Jan 2027",
+        ("Seasonal forecasts", "103", "60", "23 Jan 2027",
          "Forecast outlooks, subject to accuracy validation"),
-        ("Full seasonal bulletin", "156", "8 Apr 2027",
+        ("Full seasonal bulletin", "156", "61", "8 Apr 2027",
          "Complete quarterly PDF product with forecasts"),
-        ("Conservative finish (80% confidence)", "184", "16 May 2027", "—"),
+        ("Conservative finish (80%)", "184", "61", "16 May 2027", "—"),
     ],
     foot=[("Revenue can start today with the report, and at the API in under three "
            "months. ", 1),
@@ -122,6 +123,7 @@ T["en"] = dict(
 )
 
 T["es"] = dict(
+    scale=1.00,
     out="Honduras_Climate_API_Onepager_ES.docx",
     title="API de Datos Climáticos de Honduras",
     subtitle="De una base de datos terminada a un producto vendible en tres meses",
@@ -157,7 +159,7 @@ T["es"] = dict(
     built=[("Un servicio web comercial. El cliente envía una ubicación —una finca, un "
             "municipio o el país entero— junto con lo que quiere saber, y recibe datos "
             "o un documento terminado. ", 0),
-           ("60 servicios tras una sola clave de API", 1),
+           ("61 servicios tras una sola clave de API", 1),
            (": histórico diario desde 1950; normales climáticas y cuánto se aparta la "
             "temporada actual de ellas; indicadores de sequía, grados-día y agua para "
             "el cultivo; exposición a huracanes; pronósticos estacionales; archivos "
@@ -171,24 +173,23 @@ T["es"] = dict(
     assume=[("Un desarrollador trabajando con asistencia de IA, ", 0),
             ("seis horas de trabajo concentrado al día, cinco días por semana", 1),
             (", comenzando el 1 de septiembre de 2026.", 0)],
-    cols=("Hito", "Días", "Fecha", "Qué se puede vender"),
+    cols=("Hito", "Días", "Servicios", "Fecha", "Qué se puede vender"),
     rows=[
-        ("Informe mensual en PDF", "0", "DISPONIBLE YA",
-         "Boletín agroclimático mensual con marca, vendible hoy por suscripción"),
-        ("Primer servicio en línea", "20", "29 sep 2026",
+        ("Informe mensual en PDF", "0", "0", "DISPONIBLE YA",
+         "Boletín agroclimático mensual, vendible hoy por suscripción"),
+        ("Primer servicio en línea", "20", "6", "29 sep 2026",
          "Un endpoint seguro, publicado en internet"),
-        ("Producto vendible", "60", "24 nov 2026",
-         "Histórico, normales, anomalías, indicadores de sequía, archivos de cultivo, "
-         "descargas masivas"),
-        ("Informes tras la API", "68", "5 dic 2026",
-         "Informes por finca y por departamento, a demanda y en autoservicio"),
-        ("Amenazas y sequía", "82", "24 dic 2026",
+        ("Producto vendible", "60", "32", "24 nov 2026",
+         "Histórico, normales, anomalías, sequía, archivos de cultivo, descargas"),
+        ("Informes tras la API", "68", "40", "5 dic 2026",
+         "Informes por finca y departamento, en autoservicio"),
+        ("Amenazas y sequía", "82", "53", "24 dic 2026",
          "Exposición a huracanes, alertas municipales de sequía"),
-        ("Pronósticos estacionales", "103", "23 ene 2027",
-         "Perspectivas de pronóstico, sujetas a validación de precisión"),
-        ("Boletín estacional completo", "156", "8 abr 2027",
-         "Producto trimestral en PDF completo, con pronósticos"),
-        ("Cierre conservador (80% de confianza)", "184", "16 may 2027", "—"),
+        ("Pronósticos estacionales", "103", "60", "23 ene 2027",
+         "Pronósticos, sujetos a validación de precisión"),
+        ("Boletín estacional completo", "156", "61", "8 abr 2027",
+         "Producto trimestral en PDF, con pronósticos"),
+        ("Cierre conservador (80%)", "184", "61", "16 may 2027", "—"),
     ],
     foot=[("Los ingresos pueden empezar hoy con el informe, y con la API en menos de "
            "tres meses. ", 1),
@@ -224,6 +225,7 @@ T["es"] = dict(
 # Brazilian Portuguese (pt-BR): arquivos/registros/umidade/grade/fazenda/
 # hospedagem/requisições/sob demanda — not pt-PT.
 T["pt"] = dict(
+    scale=0.95,
     out="Honduras_Climate_API_Onepager_PT_BR.docx",
     title="API de Dados Climáticos de Honduras",
     subtitle="De uma base de dados pronta a um produto vendável em três meses",
@@ -249,9 +251,8 @@ T["pt"] = dict(
          "norte-americanos.", 0)],
     b3=[("O gerador mensal de relatórios em PDF ", 0), ("já funciona hoje", 1),
         (". Com identidade visual, em inglês/espanhol/português, oito páginas: chuva e "
-         "temperatura frente ao normal, índice de seca, graus-dia de crescimento, "
-         "balanço hídrico e mapas do país célula a célula. Gerado em 37 segundos a "
-         "partir de dados ao vivo.", 0)],
+         "temperatura frente ao normal, índice de seca, graus-dia, balanço hídrico e "
+         "mapas do país célula a célula. Gerado em 37 segundos com dados ao vivo.", 0)],
     b4=[("O que falta é a ", 0), ("camada de serviço", 1),
         (". Hoje o único acesso é uma senha de banco de dados numa rede doméstica — "
          "sem site, sem login, sem nada que um cliente possa chamar. Essa é a lacuna.",
@@ -259,38 +260,36 @@ T["pt"] = dict(
     built=[("Um serviço web comercial. O cliente envia uma localização — uma fazenda, "
             "um município ou o país inteiro — junto com o que quer saber, e recebe "
             "dados ou um documento pronto. ", 0),
-           ("60 serviços atrás de uma única chave de API", 1),
+           ("61 serviços atrás de uma única chave de API", 1),
            (": histórico diário desde 1950; normais climatológicas e o quanto a "
             "temporada atual se afasta delas; indicadores de seca, graus-dia e água para a "
             "cultura; exposição a furacões; previsões sazonais; arquivos prontos para "
             "o modelo de culturas DSSAT; e ", 0),
            ("relatórios PDF automáticos", 1),
-           (" — o boletim mensal que já funciona, mais resumos por fazenda e, mais "
-            "adiante, a perspectiva sazonal completa no padrão governamental. O acesso "
-            "é medido por chave de API, o mesmo modelo que Stripe e OpenAI usam. A "
-            "cobrança não está incluída, mas nada precisará ser refeito para "
-            "acrescentá-la depois.", 0)],
+           (" — o boletim mensal que já funciona, mais resumos por fazenda e, adiante, a "
+            "perspectiva sazonal completa no padrão governamental. O acesso é medido "
+            "por chave de API, como fazem Stripe e OpenAI. A cobrança não está "
+            "incluída, mas nada precisará ser refeito para adicioná-la depois.", 0)],
     assume=[("Um desenvolvedor trabalhando com assistência de IA, ", 0),
             ("seis horas de trabalho concentrado por dia, cinco dias por semana", 1),
             (", começando em 1 de setembro de 2026.", 0)],
-    cols=("Marco", "Dias", "Data", "O que pode ser vendido"),
+    cols=("Marco", "Dias", "Serviços", "Data", "O que pode ser vendido"),
     rows=[
-        ("Relatório mensal em PDF", "0", "DISPONÍVEL AGORA",
-         "Boletim agroclimático mensal com marca, vendável hoje por assinatura"),
-        ("Primeiro serviço no ar", "20", "29 set 2026",
+        ("Relatório mensal em PDF", "0", "0", "DISPONÍVEL AGORA",
+         "Boletim agroclimático mensal, vendável hoje por assinatura"),
+        ("Primeiro serviço no ar", "20", "6", "29 set 2026",
          "Um endpoint seguro, publicado na internet"),
-        ("Produto vendável", "60", "24 nov 2026",
-         "Histórico, normais, anomalias, indicadores de seca, arquivos de cultura, "
-         "exportação em massa"),
-        ("Relatórios atrás da API", "68", "5 dez 2026",
-         "Relatórios por fazenda e por departamento, sob demanda e autoatendimento"),
-        ("Ameaças e seca", "82", "24 dez 2026",
+        ("Produto vendável", "60", "32", "24 nov 2026",
+         "Histórico, normais, anomalias, seca, arquivos de cultura, exportação"),
+        ("Relatórios atrás da API", "68", "40", "5 dez 2026",
+         "Relatórios por fazenda e departamento, autoatendimento"),
+        ("Ameaças e seca", "82", "53", "24 dez 2026",
          "Exposição a furacões, alertas municipais de seca"),
-        ("Previsões sazonais", "103", "23 jan 2027",
-         "Perspectivas de previsão, sujeitas a validação de acurácia"),
-        ("Boletim sazonal completo", "156", "8 abr 2027",
-         "Produto trimestral em PDF completo, com previsões"),
-        ("Encerramento conservador (80% de confiança)", "184", "16 mai 2027", "—"),
+        ("Previsões sazonais", "103", "60", "23 jan 2027",
+         "Previsões, sujeitas a validação de acurácia"),
+        ("Boletim sazonal completo", "156", "61", "8 abr 2027",
+         "Produto trimestral em PDF, com previsões"),
+        ("Encerramento conservador (80%)", "184", "61", "16 mai 2027", "—"),
     ],
     foot=[("A receita pode começar hoje com o relatório, e com a API em menos de três "
            "meses. ", 1),
@@ -315,11 +314,11 @@ T["pt"] = dict(
         (" A fonte prevista para os contornos de departamentos e municípios proíbe a "
          "redistribuição comercial. Existe uma fonte equivalente com licença "
          "comercial. Trocar antes de escrever esse código não custa nada.", 0)],
-    caveat=[("A acurácia da previsão sazonal sobre o terreno montanhoso de Honduras "
-             "não está comprovada. O plano a mede antes que qualquer previsão chegue a "
-             "um cliente. Se a acurácia for baixa, as previsões ficam desligadas e "
-             "todo o resto do produto segue intacto — que é exatamente por que elas "
-             "estão agendadas por último, atrás do que já gera receita.", 0)],
+    caveat=[("A acurácia da previsão sazonal sobre o terreno montanhoso de Honduras não "
+             "está comprovada. O plano a mede antes que qualquer previsão chegue a um "
+             "cliente. Se for baixa, as previsões ficam desligadas e todo o resto do "
+             "produto segue intacto — por isso estão agendadas por último, atrás do "
+             "que já gera receita.", 0)],
 )
 
 
@@ -345,6 +344,7 @@ def rule_after(paragraph, color=RULE, size=6):
 
 def build(lang):
     c = T[lang]
+    sc = c.get("scale", 1.0)   # type scale: ES/PT run longer than EN
     doc = Document()
 
     s = doc.sections[0]
@@ -355,7 +355,7 @@ def build(lang):
 
     normal = doc.styles["Normal"]
     normal.font.name = "Calibri"
-    normal.font.size = Pt(8.8)
+    normal.font.size = Pt(8.8 * sc)
     normal.font.color.rgb = INK
     pf = normal.paragraph_format
     pf.space_before = Pt(0)
@@ -368,7 +368,7 @@ def build(lang):
         p.paragraph_format.space_before = Pt(before)
         for text, bold in parts:
             r = p.add_run(text)
-            r.font.size = Pt(size)
+            r.font.size = Pt(size * sc)
             r.bold = bool(bold)
             r.font.color.rgb = INK
         return p
@@ -378,7 +378,7 @@ def build(lang):
         p.paragraph_format.space_before = Pt(5.5)
         p.paragraph_format.space_after = Pt(2)
         r = p.add_run(text.upper())
-        r.font.size = Pt(8.5)
+        r.font.size = Pt(8.5 * sc)
         r.bold = True
         r.font.color.rgb = ACCENT
         rule_after(p)
@@ -391,7 +391,7 @@ def build(lang):
         p.paragraph_format.first_line_indent = Inches(-0.13)
         for text, bold in parts:
             r = p.add_run(text)
-            r.font.size = Pt(size)
+            r.font.size = Pt(size * sc)
             r.bold = bool(bold)
             r.font.color.rgb = INK
         return p
@@ -399,14 +399,14 @@ def build(lang):
     t = doc.add_paragraph()
     t.paragraph_format.space_after = Pt(0)
     r = t.add_run(c["title"])
-    r.font.size = Pt(18)
+    r.font.size = Pt(18 * sc)
     r.bold = True
     r.font.color.rgb = ACCENT
 
     st = doc.add_paragraph()
     st.paragraph_format.space_after = Pt(6)
     r = st.add_run(c["subtitle"])
-    r.font.size = Pt(10)
+    r.font.size = Pt(10 * sc)
     r.italic = True
     r.font.color.rgb = MUTED
     rule_after(st, color="0F5E7A", size=10)
@@ -424,10 +424,10 @@ def build(lang):
     rich(c["assume"], size=8.5, after=4)
 
     rows = [c["cols"]] + c["rows"]
-    table = doc.add_table(rows=len(rows), cols=4)
+    table = doc.add_table(rows=len(rows), cols=5)
     table.style = "Table Grid"
     table.alignment = WD_TABLE_ALIGNMENT.CENTER
-    widths = [Inches(1.76), Inches(0.46), Inches(0.94), Inches(4.09)]
+    widths = [Inches(1.62), Inches(0.42), Inches(0.56), Inches(0.88), Inches(3.77)]
 
     for ri, row in enumerate(rows):
         for ci, text in enumerate(row):
@@ -436,10 +436,10 @@ def build(lang):
             p = cell.paragraphs[0]
             p.paragraph_format.space_before = Pt(0.8)
             p.paragraph_format.space_after = Pt(0.8)
-            if ci == 1:
+            if ci in (1, 2):
                 p.alignment = WD_ALIGN_PARAGRAPH.CENTER
             r = p.add_run(text)
-            r.font.size = Pt(8.2)
+            r.font.size = Pt(8.0 * sc)
             if ri == 0:
                 r.bold = True
                 r.font.color.rgb = RGBColor(0xFF, 0xFF, 0xFF)

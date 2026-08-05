@@ -77,7 +77,7 @@ the *full* government-style quarterly bulletin needs on top of the observed half
 
 A commercial web service. A customer sends a location — a farm's coordinates, a
 municipality, or the whole country — plus what they want to know. They get back
-either data or a finished document. **60 distinct services**, including:
+either data or a finished document. **61 distinct services**, including:
 
 - Daily weather history for any point, going back to 1950
 - What is "normal" for that place, and how far the current season is from it
@@ -285,7 +285,7 @@ scaling risk.
 
 ---
 
-## Endpoint inventory (60)
+## Endpoint inventory (61)
 
 Legend: ✅ table exists · 🟡 planned context layer, unbuilt · 🔴 new to this design
 
@@ -305,6 +305,28 @@ Legend: ✅ table exists · 🟡 planned context layer, unbuilt · 🔴 new to t
 
 26 tables needed: **3 exist**, 12 are the planned context layer, 11 are new
 (tenancy, jobs, rollups, freshness).
+
+### ⬛ How many are live at each milestone
+
+61 is the **end state**, not what ships first. Most endpoints are gated on data the
+silver layer does not hold yet, so the count ramps with the pipeline:
+
+| Milestone | Days | New | **Live** | What unlocks them |
+|---|---|---|---|---|
+| M-now monthly PDF | 0 | — | **0** | Not an API — a generated document |
+| M0 walking skeleton | 20 | 6 | **6** | Point series/aggregates/GDD/water-balance (8, 9, 12, 13) + account & keys (56, 57) |
+| M1 sellable product | 60 | 26 | **32** | Grid & metadata (1–7), normals (19, 20, 22), `.WTH` (11), summary (10), area (14, 16–18), exports (43–47), façade (2), usage & limits (58–60) |
+| M2 reports behind the API | 68 | 8 | **40** | Report endpoints (49–54) + ENSO index & current (29, 31) once `climate_index` lands |
+| M3 hazard & drought | 82 | 13 | **53** | Admin (39–42), the admin-gated pair they unblock (15, 21), hazard & drought (32–38) |
+| M4 forecasts | 103 | 7 | **60** | Forecast (23–28) + ENSO plume (30) — **all behind the Phase 5 skill gate** |
+| M5 full bulletin | 156 | 1 | **61** | `POST /v1/reports type=seasonal_bulletin` (48) |
+
+Two consequences worth stating plainly. **The sellable product at day 60 is 32
+endpoints, not 61** — a little over half, and it is the half that needs no forecast,
+no hurricane track and no ENSO feed. And **29 of the 61 depend on data that does not
+exist today**, which is why the endpoint count is a poor progress metric on its own:
+M4 adds only 7 endpoints for 21 dev-days because the cost is in the pipeline behind
+them, not the routes.
 
 ### The façade — the stated interaction model
 
