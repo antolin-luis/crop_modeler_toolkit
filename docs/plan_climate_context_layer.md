@@ -289,9 +289,24 @@ CREATE TABLE IF NOT EXISTS tc_cell_exposure (
 
 `tc_cell_exposure` is the derived table that earns its keep: which cells were hit, when, how hard. Computed once per storm by buffering the track line and intersecting the grid.
 
-### 5.7 `wth_precip_alt` (CHIRPS)
+### 5.7 `wth_precip_alt` (CHIRPS) — ⚠️ SUPERSEDED
+
+> **This section is obsolete. See [`plan_chirps_fine_grid.md`](plan_chirps_fine_grid.md).**
+>
+> The DDL below assumed CHIRPS aggregated onto the 0.25° ERA5 grid, reusing `child_id`. That
+> was rejected: aggregating a 0.05° product to 0.25° at ingest discards the 25× spatial
+> detail that is the entire reason to add it. CHIRPS is stored on its **own 0.05° grid**
+> (`chirps_base_grid`, 5-char codes) with the fact table keyed on `(fparent_id, fine_id,
+> date, source)` and `source` as `SMALLINT`. The two grids do not nest — ERA5 cell edges land
+> on `0.125 + k·0.25`, not a multiple of 0.05 — so conversion between them is the stored
+> area-weight table `chirps_era5_map`, not arithmetic.
+>
+> The "default to a recent 10-year window" guidance below is also obsolete: at Tocantins
+> scale the full 45.5-year backfill costs ~72 EECU-h (~7% of a month's quota). Storage
+> (~57 GB), not EECU, is the binding constraint.
 
 ```sql
+-- OBSOLETE — not what was built.
 CREATE TABLE IF NOT EXISTS wth_precip_alt (
     parent_id     CHAR(4)  NOT NULL,
     child_id      CHAR(4)  NOT NULL,
@@ -302,8 +317,6 @@ CREATE TABLE IF NOT EXISTS wth_precip_alt (
     PRIMARY KEY (parent_id, child_id, date, source)
 ) PARTITION BY LIST (parent_id);
 ```
-
-**Deliberately a separate table, and deliberately year-scoped.** See §10 — a full 46-year CHIRPS backfill is the same order of magnitude as the entire existing `wth_base`. Default the DAG to a recent window (10 years) and make the full backfill an explicit opt-in.
 
 ### 5.8 `admin_boundary` and `drought_alert`
 
@@ -380,7 +393,8 @@ src/
     ibtracs.py        # best-track archive
     nhc.py            # live advisories
     exposure.py       # track buffer x grid -> tc_cell_exposure
-  chirps.py           # GEE UCSB-CHG/CHIRPS/DAILY -> wth_precip_alt
+  # chirps.py         # BUILT, but at src/gee/chirps.py on a 0.05° grid — see
+                      # plan_chirps_fine_grid.md; not this layout
   ndvi.py             # GEE NDVI -> ndvi_anomaly
   admin/
     boundaries.py     # GADM -> admin_boundary + admin_cell_map
@@ -495,8 +509,13 @@ Four stages. Each phase lists deliverable, tests, and an acceptance criterion th
 - *Tests:* `test_cyclones.py` — a synthetic straight-line track exposes exactly the cells within the buffer; category classification at Saffir-Simpson boundaries.
 - *Accept:* Hurricane Mitch (1998) exposure over Honduras returns a plausible cell set with correct dates — a case with a known answer.
 
-**Phase 9 — CHIRPS → `wth_precip_alt`** (GEE; default 10-year window per §10)
-- **Export budget (§3.4).** 365 bands per year — ERA5's order — but CHIRPS is already a daily product, so there is **no local-day reduction and no zone mosaic**: `zones = 1`. Losing the zone multiplier takes the budget ~4× further than ERA5's at the same extent. Pressure **low-moderate**; probe one year before backfilling ten.
+**Phase 9 — CHIRPS → `wth_precip_alt`** — ✅ **CODE COMPLETE, backfill pending.** Built on a
+native 0.05° grid rather than the 0.25° aggregate this plan assumed; see
+[`plan_chirps_fine_grid.md`](plan_chirps_fine_grid.md) for what was actually built and why.
+Both v2.0 and v3.0 are loaded, on the full 1981→present history (45.5 years — no CHIRPS
+product reaches further back, so the "46-year" figure used elsewhere in this document is
+slightly optimistic).
+- **Export budget (§3.4).** 365 bands per year — ERA5's order — but CHIRPS is already a daily product, so there is **no local-day reduction and no zone mosaic**: `zones = 1`. Losing the zone multiplier takes the budget ~4× further than ERA5's at the same extent. Pressure **low-moderate**; probe one year before backfilling ten. ⚠️ At 0.05° the cell count is 25× higher, so the ceiling must be re-probed — that gate is Phase 0 of the fine-grid plan.
 - *Accept:* CHIRPS and ERA5 monthly precip for the same cells correlate as expected, and their disagreement over complex terrain is visible — which is the reason to have both. One export at the target extent completes at `attempts=1`.
 
 **Phase 10 — NMME → `forecast_value`** (schema already proven by Phase 4; mostly a new fetch adapter)

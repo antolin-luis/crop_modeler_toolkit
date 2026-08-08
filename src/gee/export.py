@@ -30,6 +30,13 @@ _CRS = "EPSG:4326"
 _HALF = RESOLUTION / 2.0
 _CRS_TRANSFORM = [RESOLUTION, 0, -180.0 - _HALF, 0, -RESOLUTION, 90.0 + _HALF]
 
+# CHIRPS sits on a different grid convention: its pixel EDGES fall on multiples of 0.05°,
+# so the corner is the multiple itself with no half-pixel shift (contrast the ERA5 line
+# above, where centres are on the multiples). Exporting CHIRPS through _CRS_TRANSFORM
+# resamples every pixel onto the 0.25° grid — plausible-looking output, wrong values. See
+# src/grid/fine_spec.py, which owns these constants.
+FINE_CRS_TRANSFORM = [0.05, 0, -180.0, 0, -0.05, 60.0]
+
 _TERMINAL = {"COMPLETED", "FAILED", "CANCELLED", "CANCEL_REQUESTED"}
 
 
@@ -99,12 +106,18 @@ def start_export(
     name_prefix: str,
     description: str,
     land_only: bool = True,
+    crs_transform: list[float] | None = None,
 ) -> "ee.batch.Task":
     """Submit the GCS export task for one ``(variable, year)`` and return the started task.
 
     ``land_only`` (default) clips the export region to land via LSIB; ocean cells then come
     back masked (nodata) and are dropped on read. Set false to export the full rectangle
     (incl. ocean, matching the CDS bronze coverage).
+
+    ``crs_transform`` defaults to the canonical 0.25° ERA5 grid. Pass
+    :data:`FINE_CRS_TRANSFORM` for a 0.05° source such as CHIRPS — the pixel grid must match
+    the source's own, or EE resamples on the way out and the exported values are no longer
+    the product's.
     """
     image = _to_multiband(daily_col)
     region = _land_region(extent) if land_only else _region(extent)
@@ -115,7 +128,7 @@ def start_export(
         fileNamePrefix=name_prefix,
         region=region,
         crs=_CRS,
-        crsTransform=_CRS_TRANSFORM,
+        crsTransform=crs_transform if crs_transform is not None else _CRS_TRANSFORM,
         fileFormat="GeoTIFF",
         maxPixels=int(1e13),
         formatOptions={"cloudOptimized": True},

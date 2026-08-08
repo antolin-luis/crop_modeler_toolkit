@@ -21,16 +21,17 @@ Run::
     uv run python scripts/gee_cost_probe.py gfs --init 2026-08-01 \\
         --extent 12.0 -90.0 17.5 -83.0 --sample E2
     uv run python scripts/gee_cost_probe.py chirps --year 2020 \\
-        --extent 12.0 -90.0 17.5 -83.0 --sample E3
+        --extent -13.50 -50.75 -5.15 -45.70 --collection v3_rnl --sample E3
 
 ``--keep-dir`` leaves the GeoTIFF shards on disk so ``du`` can independently confirm
 ``bytes_remote``. Never do that on the bronze path — the temp-dir teardown there is what
 keeps the SSD from filling.
 
-Caveat for E3: ``start_export`` pins the canonical 0.25° ``crsTransform``, so CHIRPS
-(native 0.05°) is resampled server-side on the way out. Which reduction that *should* be —
-nearest vs area-weighted mean — is a Phase 9 decision. This probe measures cost, not
-values; do not read its output as a statement about the aggregation method.
+E3 exports CHIRPS on its **native 0.05° grid** (``export.FINE_CRS_TRANSFORM``), not the
+canonical 0.25° one. That is deliberate and load-bearing: a 0.25° export of CHIRPS carries
+25x fewer output pixels, so measuring it would understate the real backfill's cost by more
+than an order of magnitude and the ceiling gate would pass on a workload nobody intends to
+run. ``--coarse`` restores the old resampled behaviour for comparison only.
 """
 
 from __future__ import annotations
@@ -46,10 +47,20 @@ import ee
 
 from src.config import resolve_bronze_dir
 from src.gee.client import GEEClient
+from src.gee.export import FINE_CRS_TRANSFORM
 from src.gee.metrics import RunMetrics, append_record, metrics_path, run_export
 
 GFS_COLLECTION = "NOAA/GFS0P25"
-CHIRPS_COLLECTION = "UCSB-CHG/CHIRPS/DAILY"
+
+# Short aliases so a probe run does not hinge on typing an asset path correctly. Note the
+# org differs between versions — v2 is UCSB-CH**G**, v3 is UCSB-CH**C**; they are easy to
+# transpose and the wrong one fails late, inside EE, with an unhelpful message.
+CHIRPS_COLLECTIONS = {
+    "v2": "UCSB-CHG/CHIRPS/DAILY",            # v2.0 final,  50S-50N
+    "v3_rnl": "UCSB-CHC/CHIRPS/V3/DAILY_RNL",  # v3.0 ERA5-disaggregated, 60S-60N
+    "v3_sat": "UCSB-CHC/CHIRPS/V3/DAILY_SAT",  # v3.0 IMERG-disaggregated, near-real-time
+}
+CHIRPS_COLLECTION = CHIRPS_COLLECTIONS["v2"]  # back-compat default
 
 # One band each: a probe sizes the *shape* of the work, and per-variable cost is linear in
 # band count. Multiply by the real variable count when extrapolating.
@@ -86,11 +97,16 @@ def gfs_daily(init_date: str, *, lead_days: int) -> "ee.ImageCollection":
     return ee.ImageCollection(ee.List.sequence(0, lead_days - 1).map(_day))
 
 
-def chirps_daily(year: int) -> "ee.ImageCollection":
-    """One image per day of ``year`` — CHIRPS is already daily, so this only re-stamps."""
+def chirps_daily(year: int, collection: str = CHIRPS_COLLECTION) -> "ee.ImageCollection":
+    """One image per day of ``year`` — CHIRPS is already daily, so this only re-stamps.
+
+    No local-day reduction and no timezone zones: CHIRPS ships as a finished daily product,
+    so there are no sub-daily values left to re-window. Its day is therefore *not* the same
+    24-hour window as ``wth_base.date``.
+    """
     start = ee.Date.fromYMD(year, 1, 1)
     n_days = 366 if calendar.isleap(year) else 365
-    src = ee.ImageCollection(CHIRPS_COLLECTION).select(CHIRPS_BAND)
+    src = ee.ImageCollection(collection).select(CHIRPS_BAND)
 
     def _day(i):
         day_start = start.advance(ee.Number(i), "day")
@@ -136,6 +152,17 @@ def main() -> None:
     )
     ap.add_argument("--lead-days", type=int, default=16, help="GFS forecast horizon")
     ap.add_argument("--year", type=int, help="CHIRPS year (E3)")
+    ap.add_argument(
+        "--collection",
+        default="v2",
+        help="CHIRPS version: %s, or a full EE asset id" % ", ".join(CHIRPS_COLLECTIONS),
+    )
+    ap.add_argument(
+        "--coarse",
+        action="store_true",
+        help="export CHIRPS resampled onto the 0.25° ERA5 grid instead of its native "
+        "0.05° one. Comparison only — it does not measure the workload we intend to run.",
+    )
     ap.add_argument("--sample", default="", help="calibration sample id, e.g. E2")
     ap.add_argument("--data-root", default=None, help="where _gee_metrics.jsonl lives")
     ap.add_argument("--keep-dir", default=None, help="keep shards here for a du check")
@@ -146,6 +173,7 @@ def main() -> None:
     client = GEEClient()
     bucket = client.require_bucket()
 
+    crs_transform = None
     if args.source == "gfs":
         if not args.init:
             ap.error("--init is required for gfs")
@@ -155,10 +183,14 @@ def main() -> None:
     else:
         if not args.year:
             ap.error("--year is required for chirps")
-        collection = chirps_daily(args.year)
-        dataset = CHIRPS_COLLECTION
+        dataset = CHIRPS_COLLECTIONS.get(args.collection, args.collection)
+        collection = chirps_daily(args.year, dataset)
         days = 366 if calendar.isleap(args.year) else 365
-        tag = f"probe_chirps_{args.year}"
+        version = args.collection if args.collection in CHIRPS_COLLECTIONS else "custom"
+        grid = "coarse" if args.coarse else "fine"
+        tag = f"probe_chirps_{version}_{grid}_{args.year}"
+        # Native 0.05° unless explicitly asked otherwise — see the module docstring.
+        crs_transform = None if args.coarse else FINE_CRS_TRANSFORM
 
     name_prefix = f"{client.gcs_prefix}/{tag}"
     m = RunMetrics(
@@ -188,6 +220,7 @@ def main() -> None:
                 dest_dir=dest,
                 metrics=m,
                 land_only=args.land_only,
+                crs_transform=crs_transform,
             )
             valid, total = count_pixels(paths)
             m.note_units(cells=valid, days=days)
@@ -196,10 +229,12 @@ def main() -> None:
         m.note_error(exc)
         raise
     finally:
+        # Print BEFORE persisting, and never let persisting raise. An export that has
+        # already run has already spent EECU; losing its numbers to an unwritable data
+        # root — or worse, masking a real export error with a PermissionError raised out
+        # of this finally — turns a measurement into nothing. Same rule as the bronze
+        # path's _emit_metrics.
         record = m.to_record()
-        path = metrics_path(resolve_bronze_dir(args.data_root))
-        append_record(path, record)
-        print(f"recorded -> {path}", flush=True)
         for key in (
             "task_id", "eecu_hours", "bytes_remote", "n_blobs", "cells", "days",
             "n_units", "bytes_per_unit", "eecu_per_unit", "raster_pixels",
@@ -211,6 +246,18 @@ def main() -> None:
             print(
                 "  NOTE: EE reported no batch_eecu_usage_seconds — read EECU for "
                 f"task {record.get('task_id')} off https://code.earthengine.google.com/tasks",
+                flush=True,
+            )
+        try:
+            path = metrics_path(resolve_bronze_dir(args.data_root))
+            append_record(path, record)
+            print(f"recorded -> {path}", flush=True)
+        except Exception as exc:
+            print(
+                f"WARNING: cost record NOT persisted ({type(exc).__name__}: {exc}).\n"
+                "  The numbers above are the measurement — copy them before re-running.\n"
+                "  DATA_DIR defaults to /data, which exists inside the container but not "
+                "on the host; pass --data-root .localdata/<name> for a host-side run.",
                 flush=True,
             )
 

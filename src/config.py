@@ -95,9 +95,39 @@ def resolve_bronze_dir(data_root: str | Path | None = None) -> Path:
     unset (the common case) this is exactly ``load_config().paths.bronze_dir``, so
     existing single-region runs are unaffected. Each root carries its own ``bronze/`` tree
     and its own manifest, so regions never collide or overwrite each other.
+
+    **Pass the folder name.** ``data_root="TO"`` means ``$DATA_DIR/TO`` — the mounted volume
+    (default ``/data``; on the Pi, the SSD). An absolute path under ``$DATA_DIR`` also works
+    and means the same thing, so ``"TO"`` and ``"/data/TO"`` are interchangeable.
+
+    A bare name is anchored to ``$DATA_DIR`` rather than to the process's working directory,
+    which is the whole point. Anchoring it to the CWD is what silently put a full year of
+    CHIRPS bronze in ``/opt/airflow/TO/bronze`` — off the bind mount, DAG green, one
+    ``docker compose down`` from gone, and undiscoverable until it was. The subsequent
+    "must be absolute" attempt only moved the trap: ``"/TO"`` is absolute, is the container
+    root, and died in ``mkdir`` with ``PermissionError`` after the task had started.
+
+    Anything that lands outside ``$DATA_DIR`` is refused, since bronze written there does
+    not survive a container recreate. That is a lexical prefix check, not a filesystem
+    probe, so this stays a pure function of its inputs and behaves identically on the Pi, in
+    CI, and in a test. To use a different disk, point ``DATA_DIR`` at it.
     """
     if data_root:
-        return Path(data_root) / "bronze"
+        # normpath, not resolve(): collapses ".." lexically without touching the filesystem
+        # or following symlinks, so "../TO" and "/data/../TO" both land outside and are
+        # caught by the check below rather than escaping it.
+        data_dir = Path(os.path.normpath(os.environ.get("DATA_DIR", "/data")))
+        root = Path(os.path.normpath(data_root))
+        if not root.is_absolute():
+            root = Path(os.path.normpath(data_dir / root))
+        if root != data_dir and not root.is_relative_to(data_dir):
+            raise ValueError(
+                f"data_root {str(data_root)!r} resolves to {str(root)!r}, outside DATA_DIR "
+                f"({str(data_dir)!r}) — bronze written there is not on the mounted volume "
+                "and is lost when the container is recreated. Pass a folder name, e.g. "
+                f"{root.name!r}, which means {str(data_dir / root.name)!r}."
+            )
+        return root / "bronze"
     return load_config().paths.bronze_dir
 
 
