@@ -176,6 +176,12 @@ with DAG(
     catchup=False,
     tags=["chirps", "bronze", "gee"],
     render_template_as_native_obj=True,  # keep lists/ints real through dag_run.conf
+    # One run at a time. Re-triggering while a run is live used to start a second one (the
+    # default cap is 16), and since each run ends in its own kick_transform, concurrent
+    # downloads multiply into concurrent transforms — which is what froze the Pi on
+    # 2026-08-08. Queuing is the right behaviour anyway: the manifest makes a re-run cheap,
+    # but only once the first run has finished writing it.
+    max_active_runs=1,
     params={
         # [S, W, N, E], snapped to 0.05°. Default is Tocantins, Brazil.
         "extent": [-13.50, -50.75, -5.15, -45.70],
@@ -211,6 +217,17 @@ with DAG(
     kick_transform = TriggerDagRunOperator(
         task_id="kick_transform",
         trigger_dag_id="transform_precip_alt",
+        # Deterministic run id, so re-running this task RESETS the transform run it already
+        # created instead of minting another. Without it TriggerDagRunOperator timestamps the
+        # run id, reset_dag_run has nothing to match, and every re-execution starts a fresh
+        # concurrent transform.
+        #
+        # That is not hypothetical: `airflow tasks clear -t 'download|kick_transform' -s
+        # <date> -e <date+1>` matches every DagRun in the window, not one. Clearing to retry
+        # a single failed year re-fired kick_transform in five earlier runs at once, each
+        # spawning its own transform, and the resulting ~10 GB of task processes froze an
+        # 8 GB Pi (2026-08-08). Pair this with max_active_runs=1 above.
+        trigger_run_id="chirps__{{ dag_run.run_id }}",
         conf={
             "start_year": "{{ params.start_year }}",
             "end_year": "{{ params.end_year }}",

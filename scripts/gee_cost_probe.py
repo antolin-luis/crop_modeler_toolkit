@@ -103,6 +103,10 @@ def chirps_daily(year: int, collection: str = CHIRPS_COLLECTION) -> "ee.ImageCol
     No local-day reduction and no timezone zones: CHIRPS ships as a finished daily product,
     so there are no sub-daily values left to re-window. Its day is therefore *not* the same
     24-hour window as ``wth_base.date``.
+
+    ``toFloat`` for the same reason as ``src.gee.chirps.build_daily_collection``: the
+    missing-day placeholder is a Byte image and EE refuses to export bands of mixed type.
+    Only bites on a partial year, so probing 2020 would never surface it.
     """
     start = ee.Date.fromYMD(year, 1, 1)
     n_days = 366 if calendar.isleap(year) else 365
@@ -112,7 +116,7 @@ def chirps_daily(year: int, collection: str = CHIRPS_COLLECTION) -> "ee.ImageCol
         day_start = start.advance(ee.Number(i), "day")
         img = src.filterDate(day_start, day_start.advance(1, "day")).first()
         img = ee.Image(ee.Algorithms.If(img, img, ee.Image.constant(0).selfMask()))
-        return ee.Image(img).rename(CHIRPS_BAND).set(
+        return ee.Image(img).rename(CHIRPS_BAND).toFloat().set(
             {
                 "system:time_start": day_start.millis(),
                 "date": day_start.format("YYYY-MM-dd"),

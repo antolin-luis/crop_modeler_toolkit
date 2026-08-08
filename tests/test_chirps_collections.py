@@ -104,6 +104,28 @@ def test_v2_and_v3_build_from_different_collections(monkeypatch):
         fake_ee.ImageCollection.assert_any_call(expected)
 
 
+def test_every_band_is_cast_to_float(monkeypatch):
+    """Mixed band dtypes make EE reject the whole export.
+
+    The missing-day placeholder is ``ee.Image.constant(0)``, a *Byte* image; real CHIRPS is
+    Float32. The placeholder only fires for a day the product lacks, so 1981-2025 exported
+    fine and 2026 — the partial year past the catalog's end — failed with "Exported bands
+    must have compatible data types; found inconsistent types: Float32 and Byte." after 90
+    of 92 tasks had already succeeded. The cast must apply to every band, not just the
+    placeholder, so the type does not depend on whether a given day exists.
+    """
+    fake_ee, captured = _fake_ee_with_capture()
+    monkeypatch.setattr(chirps_mod, "ee", fake_ee)
+
+    chirps_mod.build_daily_collection("chirps_v3_rnl", 2026)
+    day_image = captured["fn"](0)
+
+    renamed = fake_ee.Image.return_value.rename.return_value
+    renamed.toFloat.assert_called()
+    # ...and the stamped image is the cast one, not the pre-cast one.
+    assert day_image is renamed.toFloat.return_value.set.return_value
+
+
 @pytest.mark.parametrize("year,expected", [(2020, 366), (2021, 365), (1981, 365)])
 def test_one_band_per_calendar_day(monkeypatch, year, expected):
     """Band count must equal day count or the date-to-band mapping on read shifts."""
@@ -138,7 +160,9 @@ def test_each_day_is_stamped_with_a_date_property(monkeypatch):
     chirps_mod.build_daily_collection("chirps_v3_rnl", 2020)
     captured["fn"](5)
 
-    props = fake_ee.Image.return_value.rename.return_value.set.call_args[0][0]
+    props = fake_ee.Image.return_value.rename.return_value.toFloat.return_value.set.call_args[
+        0
+    ][0]
     assert set(props) == {"system:time_start", "date"}
     fake_ee.Date.fromYMD.return_value.advance.return_value.format.assert_any_call(
         "YYYY-MM-dd"

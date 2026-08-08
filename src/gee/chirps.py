@@ -115,6 +115,14 @@ def build_daily_collection(source: str, year: int) -> "ee.ImageCollection":
     CHIRPS is already daily, so this re-stamps rather than reduces. A day the product is
     missing becomes a fully-masked image rather than a gap in the band list: the export's
     band count must equal the day count, or the date-to-band mapping on read silently shifts.
+
+    **Every band is cast to Float32.** ``ee.Image.constant(0)`` is a *Byte* image, while real
+    CHIRPS precipitation is Float32, and ``Export.image`` refuses a multi-band image with
+    mixed types ("Exported bands must have compatible data types"). The placeholder only
+    fires for a day the product does not have, so 1981-2025 exported fine and the first
+    failure was 2026 — the partial year past the catalog's end, where the placeholder is the
+    only thing filling July onward. The cast makes the band type independent of whether the
+    day exists, which is the property that has to hold for every future partial year too.
     """
     spec = source_spec(source)
     start = ee.Date.fromYMD(year, 1, 1)
@@ -125,7 +133,7 @@ def build_daily_collection(source: str, year: int) -> "ee.ImageCollection":
         day_start = start.advance(ee.Number(i), "day")
         img = src.filterDate(day_start, day_start.advance(1, "day")).first()
         img = ee.Image(ee.Algorithms.If(img, img, ee.Image.constant(0).selfMask()))
-        return ee.Image(img).rename(BAND).set(
+        return ee.Image(img).rename(BAND).toFloat().set(
             {
                 "system:time_start": day_start.millis(),
                 "date": day_start.format("YYYY-MM-dd"),

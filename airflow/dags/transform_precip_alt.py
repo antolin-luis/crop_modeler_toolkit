@@ -153,6 +153,18 @@ with DAG(
     catchup=False,
     tags=["chirps", "silver", "transform"],
     render_template_as_native_obj=True,
+    # ONE run at a time. This is a memory guard, not a style choice: a transform task holds
+    # ~850 MB (Airflow + pandas + pyarrow + psycopg2 baseline, plus a batch of parents), and
+    # max_active_tasks below caps tasks only *within* a run. Airflow's default
+    # max_active_runs is 16, so nothing stopped concurrent runs from multiplying that.
+    #
+    # Observed 2026-08-08: every download trigger fires its own kick_transform, and
+    # reset_dag_run only dedupes an identical run_id. Four transform runs ended up live at
+    # once — all starting at year 1981, so all re-upserting the same partitions — and 4 x 3
+    # tasks x 850 MB froze an 8 GB Pi hard enough to need a power cycle.
+    #
+    # With this at 1, a second trigger queues behind the first instead of racing it.
+    max_active_runs=1,
     # Same Pi memory rationale as transform_silver: concurrent years each hold a batch of
     # parents in RAM. A fine parent is 400 cells to a 0.25° parent's 16, so the batch size
     # below carries the difference rather than this.
