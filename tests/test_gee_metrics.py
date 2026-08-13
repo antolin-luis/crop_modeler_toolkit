@@ -117,6 +117,33 @@ def test_note_encode_chunk_accumulates_across_windows():
     assert rec["cells_exact"] is True
 
 
+def test_fine_grid_frames_are_counted_via_cell_column():
+    """The 0.05° CHIRPS path emits ``fine_id``, not ``child_id``.
+
+    Regression: ``note_encode_chunk`` hardcoded ``child_id``, so every CHIRPS bronze task
+    died with ``KeyError: 'child_id'`` *after* its export had already completed and spent
+    EECU. The cost probe never caught it because it passes ``track_cells=False``.
+    """
+    rows = [
+        {"fine_id": c, "fparent_id": c[:2], "date": d, "value": 1.0}
+        for d in ("2020-01-01", "2020-01-02")
+        for c in ("60ST4", "60ST5")
+    ]
+    m = _metrics(cell_column="fine_id")
+    m.note_encode_chunk(pd.DataFrame(rows))
+    rec = m.to_record()
+    assert rec["cells"] == 2
+    assert rec["days"] == 2
+    assert rec["bronze_rows"] == 4
+
+
+def test_a_frame_missing_the_cell_column_says_which_column_it_wanted():
+    """Fail loudly rather than fall back — a wrong guess would corrupt the cost model."""
+    m = _metrics(cell_column="fine_id")
+    with pytest.raises(KeyError, match="cell_column"):
+        m.note_encode_chunk(_frame(["AAAA"], ["2020-01-01"]))
+
+
 def test_cells_derived_when_not_tracked():
     m = _metrics(track_cells=False)
     m.note_encode_chunk(_frame(["AAAA", "AAAB"], ["2020-01-01", "2020-01-02"]))

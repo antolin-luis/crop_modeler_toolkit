@@ -19,7 +19,7 @@ Deconstructing the 28 slides by source, not by slide:
 | 3 | NMME rainfall & temperature anomaly forecast maps, monthly | **NMME** (North American Multi-Model Ensemble) | Yes — IRI Data Library OPeNDAP, ~1.0° grid |
 | 4 | ECMWF seasonal precip/temp anomaly, ASO 2026, System 5 | **ECMWF SEAS5** | Yes — **via the CDS API we already use** (`seasonal-monthly-single-levels`) |
 | 5 | Observed monthly rainfall + % anomaly maps (May, Jun, Jul) | National station network (CENAOS et al.), interpolated | Partly — stations are not public; the same field is reconstructable from CHIRPS |
-| 6 | Satellite rainfall estimate + anomaly | **CHIRPS v3.0** | Yes — and it is already in Google Earth Engine (`UCSB-CHG/CHIRPS/DAILY`) |
+| 6 | Satellite rainfall estimate + anomaly | **CHIRPS v3.0** | Yes — in Google Earth Engine as `UCSB-CHC/CHIRPS/V3/DAILY_RNL` (v2.0 is the separate `UCSB-CHG/CHIRPS/DAILY`; note CHC vs CHG). **Built** — see [`plan_chirps_fine_grid.md`](plan_chirps_fine_grid.md) |
 | 7 | Climatological normal 1991–2020 | Derived reference period | **No download needed — derivable from our own `wth_base`** |
 | 8 | NDVI anomaly vs long-term average | METOP-AVHRR via FAO GIEWS | Yes, though MODIS/VIIRS NDVI in GEE is a cleaner substitute |
 | 9 | Monthly forecast built from **analog years** (1965, 1972, 1982, 1997, 2015, 2023) | Methodology, not a dataset | **Reproducible from our own history + an ENSO index** |

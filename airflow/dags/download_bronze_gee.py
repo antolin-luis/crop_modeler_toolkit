@@ -355,7 +355,8 @@ with DAG(
         "skip_over_ceiling": True,  # fail the plan rather than submit an export the grid
                                     # already predicts EE will restart
         "data_root": "",    # per-run data root override; blank = env DATA_DIR. Give each
-                            # region its own root (e.g. /data/hn) to avoid manifest clashes.
+                            # region its own root to avoid manifest clashes. A bare folder
+                            # name is enough: "hn" means $DATA_DIR/hn.
         "sample": "",       # calibration sample id (e.g. "E1") stamped on each cost record
                             # in <bronze>/_gee_metrics.jsonl. Blank for ordinary backfills.
     },
