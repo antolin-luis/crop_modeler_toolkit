@@ -39,3 +39,14 @@ __pycache__/
 combined-with-oceans.json
 tz-oceans.zip
 tz_by_offset.*
+
+# Shapefile inputs (SoilGrids-for-DSSAT point layer and friends) — tens of MB zipped,
+# ~1 GB unpacked. The zip lives under .localdata/bronze/static/ at run time; the repo
+# only carries the reader (src/grid/dbf.py), never the data.
+*.shp.zip
+*.shp
+*.dbf
+*.shx
+*.sbn
+*.sbx
+*.prj
