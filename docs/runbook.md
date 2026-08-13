@@ -110,6 +110,73 @@ zcat seeds/era5_land_base_grid.sql.gz | \
 Only a maintainer regenerating the seed needs the `grid_build` DAG; it requires the two
 static `.nc` inputs and is not part of normal operation.
 
+### 2.1 Soil profiles (Step 6) — optional, one-off
+
+Only if you want DSSAT soil profiles alongside the weather. `soil_profile_points` holds
+1,984,797 global 5 arc-min points, each carrying a DSSAT `ID_SOIL`, and `soil_era5_map`
+pairs every 0.25° cell with the profile nearest its centre. Independent of bronze and
+silver — it needs nothing but the grid above.
+
+The source archive must live under `$DATA_DIR/bronze/static/`; that directory is owned by
+the `airflow` uid, so copy it in through the container rather than with `cp`:
+
+```bash
+docker compose cp Point5m_SoilGrids-for-DSSAT-10km_v1.shp.zip \
+  airflow-scheduler:/data/bronze/static/
+```
+
+Then trigger `soil_grid_build` (default params, nothing to pass). Roughly 100 s end to end
+on a Pi 5. The `validate` task prints the load report; `orphan_points` must be 0.
+
+```sql
+SELECT count(*) FROM soil_profile_points;                        -- 1984797
+SELECT count(DISTINCT child_id) FROM soil_era5_map;              -- 236764
+
+-- the join it exists for: a weather cell and its DSSAT soil profile
+SELECT m.child_id, m.soil_id, g.lat, g.lon
+FROM soil_era5_map m JOIN era5_land_base_grid g USING (child_id)
+WHERE m.is_nearest AND g.is_land LIMIT 10;
+```
+
+`soil_id` is a profile ID (`ISO2` + zero-padded `CELL5M`), not a filename — it goes in a
+FILEX's `ID_SOIL`. The `.SOL` files themselves are not ingested; see
+`docs/step6_soil_intake.md`.
+
+#### Coordinates in, `soil_id` out
+
+The `soil_grid_build` DAG installs these functions itself (its `install_helpers` task), so
+after a successful run they are already there — nothing to import. If you drop or edit one,
+clear and rerun that single task, or import `src/db/soil_helpers.sql` by hand (same
+procedure as `sql/wth_helpers.sql`, §5).
+
+```sql
+SELECT * FROM soil_id_at(-34.9, -56.2);          -- UY06472845, dist_km 0
+SELECT * FROM soil_id_at(-34.95, -56.05);        -- offshore: nearest, dist_km 6.91
+SELECT * FROM soil_profile_at(-34.95, -56.05);   -- exact only: 0 rows
+
+-- weather and soil for one site in one query
+SELECT s.soil_id, g.lat, g.lon, g.elevation, g.t_zone
+FROM soil_id_at(-34.9, -56.2) s JOIN era5_land_base_grid g USING (child_id);
+```
+
+From Python or the shell:
+
+```python
+from src.db.soil_query import profile_at, profiles_at
+profile_at(-34.9, -56.2).soil_id            # 'UY06472845'
+profiles_at([(-34.9, -56.2), (-10.2, -48.3)])   # whole batch, one query
+```
+
+```bash
+docker compose exec airflow-scheduler python -m src.db.soil_query --lat -34.9 --lon -56.2
+```
+
+The lookup is a primary-key read (the 5 arc-min cell id is arithmetic from the
+coordinates), so it costs one row. The layer is land-only: a coordinate on water misses its
+cell and falls back to the nearest profile within `max_km` (default 25), reporting
+`dist_km` so you can tell an exact hit from a substitute. Pass `nearest=False` /
+`soil_profile_at` if you would rather get nothing than a neighbour.
+
 ---
 
 ## 3. Bronze download (Step 3)

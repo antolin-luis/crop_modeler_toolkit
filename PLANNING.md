@@ -433,7 +433,7 @@ cell) — a silver computation to add when the header is implemented.
 
 ## 10. Airflow DAGs
 
-Four DAGs with distinct responsibilities:
+DAGs with distinct responsibilities (the four core ones, plus the soil intake):
 
 ### DAG 1 — `grid_build` (one-off / seed)
 - Inputs: the two static `.nc` (geopotential, ERA5-Land mask), block size `b`.
@@ -461,8 +461,20 @@ Four DAGs with distinct responsibilities:
   flipping `is_preliminary → FALSE` once final). The re-fetch is not complete
   until silver reflects the correction.
 
+### DAG 5 — `soil_grid_build` (one-off / seed)
+- Inputs: the SoilGrids-for-DSSAT 5 arc-min point shapefile (`$DATA_DIR/bronze/static/`),
+  block size `b`.
+- Loads `soil_profile_points` (1,984,797 global land points, each carrying a DSSAT
+  `ID_SOIL`) and builds `soil_era5_map`, which pairs every 0.25° cell with the profile
+  nearest its centre.
+- Global and truncate-and-load; `child_id` is assigned arithmetically (points snapped to
+  the containing 0.25° centre), so the bridge is an equality join, not a spatial one.
+- Independent of bronze/silver — it only needs `era5_land_base_grid`. See
+  `docs/step6_soil_intake.md`.
+
 **Dependencies:** `grid_build` → (`download_bronze` → `transform_silver`); `update`
 runs on a schedule and internally chains download→transform for its window.
+`grid_build` → `soil_grid_build`, which is otherwise off to the side.
 
 **Concurrency:** an Airflow **pool** caps simultaneous CDS requests (the CDS has
 per-user queue limits and penalizes heavy/parallel use).
@@ -471,7 +483,10 @@ per-user queue limits and penalizes heavy/parallel use).
 
 | Param          | DAG(s)            | Notes                                            |
 |----------------|-------------------|--------------------------------------------------|
-| `block_size_b` | grid_build        | parent block; `x = b²` children per parent       |
+| `block_size_b` | grid_build, soil_grid_build | parent block; `x = b²` children per parent |
+| `source`       | soil_grid_build   | shapefile archive; bare name = `$DATA_DIR/bronze/static/` |
+| `chunk_rows`   | soil_grid_build   | rows staged per COPY; sets peak memory           |
+| `build_map`    | soil_grid_build   | also build `soil_era5_map` after loading points  |
 | `extent`       | download_bronze   | bbox in -180/180; snapped to 0.25° vertices      |
 | `start_year`   | download_bronze   |                                                  |
 | `end_year`     | download_bronze   |                                                  |
