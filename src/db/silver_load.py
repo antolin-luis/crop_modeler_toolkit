@@ -130,6 +130,15 @@ def upsert_wide(conn, wide: pd.DataFrame, *, commit: bool = True) -> int:
 
     Caller must have run :func:`ensure_schema` and :func:`ensure_partitions` for the
     frame's parents. Commits on success so a long backfill resumes per batch.
+
+    **A repaired column is not overwritten.** Bronze stays corrupt after a repair — only
+    silver was fixed — so a plain ``EXCLUDED`` assignment would let any re-run of
+    ``transform_silver`` put the bad value back and clear the flag, silently, while
+    ``wth_imputation_log`` went on claiming the repair. Each value column is therefore
+    guarded by its own ``imputed`` bit and the mask is OR-ed rather than assigned. Clearing
+    the bit — :func:`src.db.issues.clear_imputed` — is the deliberate act that lets a clean
+    re-fetch land. ``is_preliminary`` still assigns from ``EXCLUDED``: it describes the
+    source, not the repair.
     """
     if wide.empty:
         return 0
@@ -147,14 +156,18 @@ def upsert_wide(conn, wide: pd.DataFrame, *, commit: bool = True) -> int:
 
     _copy_frame(conn, staging, COLUMNS, wide)
 
+    # Driven off IMPUTED_BITS so a value column cannot be added without its guard.
     assignments = ", ".join(
-        f"{c} = EXCLUDED.{c}"
-        for c in ("tmax", "tmin", "precip", "srad", "wind", "tdew", "rh", "et0",
-                  "is_preliminary", "imputed")
+        [
+            f"{column} = CASE WHEN t.imputed & {bit} > 0 THEN t.{column} "
+            f"ELSE EXCLUDED.{column} END"
+            for column, bit in IMPUTED_BITS.items()
+        ]
+        + ["is_preliminary = EXCLUDED.is_preliminary", "imputed = t.imputed | EXCLUDED.imputed"]
     )
     with conn.cursor() as cur:
         cur.execute(
-            f"INSERT INTO {TABLE} ({', '.join(COLUMNS)}) "
+            f"INSERT INTO {TABLE} AS t ({', '.join(COLUMNS)}) "
             f"SELECT {', '.join(COLUMNS)} FROM {staging} "
             "ON CONFLICT (parent_id, child_id, date) DO UPDATE SET "
             f"{assignments}, ingested_at = now()"
@@ -264,14 +277,34 @@ def record_failures(conn, failures: pd.DataFrame, parent_ids, year: int) -> int:
 
     Clearing first keeps the table truthful: a cell-day that fails today and passes after
     a bronze re-fetch must not linger as a stale failure.
+
+    **A repaired cell-day is never quarantined.** The quarantine records rows *missing*
+    from silver. Bronze stays corrupt after a field repair, so a re-transform recomputes
+    the same failing values from it and would re-file 638 cell-days that are sitting in
+    ``wth_base``, repaired, protected by their ``imputed`` bits and untouched by that very
+    run — a quarantine entry contradicting the row it points at. The unrepaired-source
+    signal is not lost: it lives in ``wth_data_issues`` as ``refetch_pending``, which is the
+    durable record of that debt.
     """
+    parents = list(parent_ids)
     with conn.cursor() as cur:
         cur.execute(
             f"DELETE FROM {FAILURES_TABLE} "
             "WHERE parent_id = ANY(%s) AND date >= %s AND date <= %s",
-            (list(parent_ids), date(year, 1, 1), date(year, 12, 31)),
+            (parents, date(year, 1, 1), date(year, 12, 31)),
         )
+    already_repaired = 0
     if not failures.empty:
         _copy_frame(conn, FAILURES_TABLE, FAILURE_COLUMNS, failures)
+        with conn.cursor() as cur:
+            # bpchar[] on the wth_base side so the join still prunes partitions.
+            cur.execute(
+                f"DELETE FROM {FAILURES_TABLE} f USING {TABLE} b "
+                "WHERE f.parent_id = ANY(%s) AND f.date >= %s AND f.date <= %s "
+                "AND b.parent_id = ANY(%s::bpchar[]) AND b.parent_id = f.parent_id "
+                "AND b.child_id = f.child_id AND b.date = f.date AND b.imputed > 0",
+                (parents, date(year, 1, 1), date(year, 12, 31), parents),
+            )
+            already_repaired = cur.rowcount
     conn.commit()
-    return len(failures)
+    return len(failures) - already_repaired

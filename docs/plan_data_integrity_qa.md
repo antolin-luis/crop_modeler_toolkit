@@ -1,6 +1,23 @@
 # Field-Level QA, an Issue Registry, and a Repair Ladder
 
-**Status:** approved, in implementation on branch `qa-field-repair`.
+**Status:** delivered. Phases 0–7 implemented and merged (PR #12, `c137c38`); the
+retro-repair of §Phase 6 has been executed against the live DB.
+
+**Revision 3 (2026-08-12).** A post-merge audit against the code and the live DB found five
+things this plan promised that the shipped code did not do — two of them load-bearing:
+`rh`/`et0` were never recomputed from repaired inputs (D4), so every `tmin`-repaired
+cell-day carried a humidity and an ET0 still derived from the −5.49 °C defect; and
+`upsert_wide` assigned `imputed` from `EXCLUDED`, so any re-run of `transform_silver` would
+silently revert all 11,007 repairs. Both are closed on branch `qa-repair-gaps`, along with
+the registry landing on `refetch_pending` instead of `imputed` (D3), the 2010-07-18
+quarantine hole (D7), and this status block.
+
+A sixth surfaced only when the guard was tested against a live 1987 re-transform: bronze is
+still corrupt, so QA recomputed the same failing `et0` and re-quarantined **638 cell-days
+that were sitting in `wth_base`, repaired and untouched by that very run** — a quarantine
+entry contradicting the row it points at. `record_failures` now purges failures whose
+cell-day carries an `imputed` bit. The quarantine records rows *missing* from silver; the
+unrepaired-source debt is the registry's job.
 
 **Revision 2 (2026-08-12).** Every claim below was re-verified against the code and the
 live database before implementation began. The core diagnosis held; seven claims did not
@@ -33,7 +50,7 @@ every such finding over time, and repair what is already stored.
 | Fact | Consequence |
 |---|---|
 | `transform_silver` is **parent-batched** — 8 parents (~128 cells) per commit (`airflow/dags/transform_silver.py:90-110`; batch size is the DAG param at `:136`, not a module constant, defaulting to `merge.iter_parent_batches(batch_size=8)`) | A "constant across all cells" test inside `build_wide` sees 128 cells, not 9,842. The field scan **must be a pre-pass over the whole var-year**, not a per-batch check. |
-| `upsert_wide` assigns **every non-key** column from `EXCLUDED` (`src/db/silver_load.py:133-144`) | A repair that rewrites one variable would null out the other seven. This is exactly how the 5.4 M-row 2020 mess was created. The repair path needs a column-scoped update, not `upsert_wide`. Verified: no `UPDATE` statement exists anywhere in `src/` or `airflow/` outside `silver_load.py:142`, so that writer is genuinely new code. |
+| `upsert_wide` assigns **every non-key** column from `EXCLUDED` (`src/db/silver_load.py:133-144`) — *since Revision 3 each value column is guarded by its `imputed` bit and the mask is OR-ed, so a re-transform no longer reverts a repair* | A repair that rewrites one variable would null out the other seven. This is exactly how the 5.4 M-row 2020 mess was created. The repair path needs a column-scoped update, not `upsert_wide`. Verified: no `UPDATE` statement exists anywhere in `src/` or `airflow/` outside `silver_load.py:142`, so that writer is genuinely new code. |
 | Quarantined rows are **absent** from `wth_base` (`record_failures` writes only to `wth_qa_failures`) | 1987-01-26 also has a 712-cell *hole*. Repair must reinstate those rows, not just correct the 9,130 wrong ones. |
 | `wth_qa_failures` PK is `(parent_id, child_id, date)` with one `reason TEXT` | It is a cell-day quarantine, not an issue tracker. A registry of *field-level* findings is a separate table. |
 | Bronze `precip` is legitimately all-zero on dry days over a small extent | A naive `nunique == 1` detector would flag real data. Thresholds must be **variable-aware**. Measured: the overwhelming majority of raw scan findings are exactly this. |
@@ -202,6 +219,14 @@ correction reversible when a fixed source appears.
 
 ### D5 — Detection is automatic and loud; repair is opt-in
 
+> **Superseded in Revision 3, by decision.** `transform_silver` now fires `repair_silver`
+> automatically for an issue still at status `detected` (`auto_repair`, on by default;
+> `auto_repair_dry_run` for the diff-only version). The argument below still stands and is
+> why the guards exist: only a *new* detection fires, every filled value carries its
+> `imputed` bit and a log row holding the original, the issue lands on `refetch_pending`
+> rather than resolved, and the repair runs as its own DAG run. The defect stays visible;
+> what changed is that the first response no longer waits for a human.
+
 `transform_silver` gains detection only: findings are written to the registry and logged
 at `WARNING`. Repair lives in a **separate `repair_silver` DAG**, triggered deliberately
 with an explicit `(variable, date)` scope.
@@ -292,7 +317,7 @@ produced the legacy files stays **open**: file mtimes cannot settle it, since th
 files are 2026-06-27 and the GEE backend landed 2026-06-26. A future re-fetch (D3 rung 1)
 answers it.
 
-### Phase 1 — `src/transform/field_qa.py` + tests
+### Phase 1 — `src/transform/field_qa.py` + tests ✅
 
 Implement D1/D2 detectors as pure functions over a `(date, value)` frame — no DB, no
 Airflow, no file IO in the detector itself, so tests are trivial.
@@ -308,9 +333,14 @@ caught). Then run it for real and assert **exactly three** findings across the w
 archive: `tmin` 1987-01-26, `tmin` 1981-08-11, `precip` 1998-05-19 — no more, no fewer.
 That is the regression bar; the Phase 0 table above is the expected output.
 
+> **Three, against a four-row table.** The bar counts *bronze-scan* findings. The fourth
+> incident, `tmin` 1987-01-25, sits on the 341 silver cells with no bronze source, so no
+> bronze-side detector can ever see it — it is registered by hand. A fourth **scan** finding
+> is a regression; a fourth **registry** row is not. Same reading applies to Phase 2 below.
+
 **Anti-pattern guard:** do not put the scan inside `build_wide` or the batch loop.
 
-### Phase 2 — Registry schema + full-archive scan
+### Phase 2 — Registry schema + full-archive scan ✅
 
 - Add `wth_data_issues` to `src/db/silver_schema.sql` (every statement `IF NOT EXISTS`,
   matching the existing file's convention).
@@ -326,7 +356,7 @@ the three Phase 0 findings — `tmin` 1987-01-26 (three files, 9,842 cells), `tm
 else. A *fourth* `precip` row means the D2 magnitude gate regressed; a CHIRPS row means the
 variable scoping did.
 
-### Phase 3 — Provenance migration
+### Phase 3 — Provenance migration ✅
 
 D4's `ALTER TABLE` + `wth_imputation_log`, plus `imputed` threaded through
 `silver_load.COLUMNS` and the upsert assignment list. Note `_STAGING_DDL` is **not** the
@@ -336,7 +366,7 @@ place for it: `is_preliminary` is appended to the temp-table DDL at the call sit
 **Verification:** `\d wth_base` shows `imputed`; a normal `transform_silver` re-run of one
 year still writes `imputed = 0` everywhere and the row counts are unchanged.
 
-### Phase 4 — The repair ladder
+### Phase 4 — The repair ladder ✅
 
 `src/transform/repair.py`: `interpolate_temporal`, `climatology_fill`, `analog_day_fill`,
 each returning `(values, method)` and never writing to the DB itself. Plus a `LADDER`
@@ -353,7 +383,7 @@ than an average of it, preserve the window's dry-day fraction, and be stable acr
 runs with the same seed. A guard test asserts `LADDER["precip"]` contains no mean-based
 rung.
 
-### Phase 5 — `repair_silver` DAG
+### Phase 5 — `repair_silver` DAG ✅
 
 Params: `issue_id` or explicit `(variable, date)`, plus `method` (`auto` walks that
 variable's `LADDER`). Writes repaired values, sets the `imputed` bits, writes
@@ -363,7 +393,7 @@ quarantined rows** from `wth_qa_failures` for the repaired cell-days.
 **Verification:** dry-run mode prints the diff without writing. Then repair one parent and
 confirm `imputed`, the log, and the registry status all agree.
 
-### Phase 6 — Execute the retro-repair
+### Phase 6 — Execute the retro-repair ✅
 
 Three known incidents (Phase 0 table). Rung 1 is unavailable (D3), so each is marked
 `refetch_pending` alongside its repair, keeping the correction reversible.
@@ -388,7 +418,7 @@ repaired cell-variable; 1987's total row count is back to `10,183 × 365 = 3,716
 its dry-cell fraction must be plausible for May — a uniform non-zero result means the
 analog draw collapsed. The 341 sourceless silver cells stay untouched (§4).
 
-### Phase 7 — Final verification
+### Phase 7 — Final verification ✅
 
 - `uv run pytest tests/` green.
 - `grep -rn "count_distinct_exact\|nunique\"" src/` returns nothing (invented-API guard).

@@ -123,6 +123,90 @@ def set_status(conn, issue_id: int, status: str, resolution: str | None = None) 
     conn.commit()
 
 
+def select_repairable(findings, registry: pd.DataFrame) -> list[dict]:
+    """Findings that warrant an automatic repair, as ``{variable, date, issue_id}``.
+
+    Only ``detected`` qualifies. Every other status is a decision somebody already made:
+    ``refetch_pending`` and ``imputed`` mean the cell-days were repaired (and a re-fire
+    would re-repair an estimate from its own estimate), ``accepted_source_defect`` means a
+    human judged there is no honest fill, and ``false_positive`` means the detector was
+    wrong. A scan re-runs on every transform, so without this filter the same three
+    incidents would trigger a repair on every single run.
+
+    Deduplicated by ``issue_id``: one incident can be reported by several detectors and by
+    several bronze files, but it is one repair.
+    """
+    if registry.empty:
+        return []
+
+    status = {
+        (row.variable, str(row.date)): (int(row.issue_id), row.status)
+        for row in registry.itertuples(index=False)
+    }
+
+    out: dict[int, dict] = {}
+    for finding in findings:
+        key = (finding["variable"], str(finding["date"]))
+        if key not in status:
+            continue
+        issue_id, state = status[key]
+        if state != STATUS_DETECTED:
+            continue
+        out[issue_id] = {
+            "variable": finding["variable"], "date": key[1], "issue_id": issue_id
+        }
+    return [out[key] for key in sorted(out)]
+
+
+def fetch_all(conn) -> pd.DataFrame:
+    """Every registry row. Small table — a few rows per incident, ever."""
+    return _select(conn, "", ())
+
+
+def clear_imputed(conn, variable: str, date, parents=None) -> int:
+    """Drop the imputation of ``variable`` on ``date``; returns the row count cleared.
+
+    The escape hatch for a clean-source re-fetch. ``silver_load.upsert_wide`` refuses to
+    overwrite a column whose ``imputed`` bit is set — that is what stops a re-transform
+    from quietly reinstating the corrupt bronze value — so replacing an estimate with real
+    data means clearing the bit first, deliberately. The log rows go with it: they exist to
+    make the estimate reversible, and once it is gone there is nothing to reverse.
+
+    ``parents`` narrows the write to a few partitions; without it the ``UPDATE`` has no
+    partition-key predicate and scans the whole table.
+    """
+    from src.db.silver_load import IMPUTED_BITS
+
+    if variable not in IMPUTED_BITS:
+        raise ValueError(
+            f"{variable!r} is not a wth_base value column; known: {', '.join(IMPUTED_BITS)}"
+        )
+
+    bit = IMPUTED_BITS[variable]
+    # ~bit in SQL would widen to integer and drag the SMALLINT column with it; the
+    # complement within the byte the bitmask actually occupies is the same thing, typed.
+    keep = 0xFF ^ bit
+
+    scope, params = "", []
+    if parents is not None:
+        scope = " AND parent_id = ANY(%s::bpchar[])"
+        params = [sorted(set(parents))]
+
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE wth_base SET imputed = imputed & %s::smallint "
+            f"WHERE date = %s AND imputed & {bit} > 0{scope}",
+            (keep, date, *params),
+        )
+        cleared = cur.rowcount
+        cur.execute(
+            f"DELETE FROM wth_imputation_log WHERE variable = %s AND date = %s{scope}",
+            (variable, date, *params),
+        )
+    conn.commit()
+    return cleared
+
+
 _COLUMNS = [
     "issue_id", "variable", "date", "detector", "cells", "detail",
     "status", "resolution", "detected_at", "resolved_at",

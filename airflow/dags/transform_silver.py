@@ -10,6 +10,14 @@ and committed per batch, so memory stays bounded regardless of extent (§2) and 
 resumes cheaply. No Airflow pool — unlike the download DAGs this is local CPU/IO with no
 external rate limit.
 
+Four stages: ``field_qa_scan`` (per year, detection only) → ``transform`` (per year) →
+``collect_repairs`` → ``auto_repair``. The scan is first because it reads bronze and needs
+nothing from the load; the repair is last because it rewrites ``wth_base`` rows that do not
+exist until the year is loaded. ``auto_repair`` fires ``repair_silver`` for a **newly
+detected** field defect only — an incident already repaired, accepted as a source defect,
+or dismissed is never re-fired, or the same three incidents would be repaired on every run.
+Set ``auto_repair=false`` to keep detection without it.
+
 "Waits for a year's variables in bronze" (§10) is a file check, not a sensor: the download
 DAGs write Parquet only after a variable-year is complete, so presence *is* the signal. A
 year with no bronze files is skipped with a log line rather than failing the run.
@@ -20,6 +28,7 @@ from __future__ import annotations
 import pendulum
 from airflow.models.dag import DAG
 from airflow.operators.python import PythonOperator
+from airflow.operators.trigger_dagrun import TriggerDagRunOperator
 
 DEFAULT_VARIABLES = ["tmax", "tmin", "precip", "srad", "wind_u", "wind_v", "tdew"]
 
@@ -46,6 +55,105 @@ def _plan(**context) -> list[dict]:
     ]
 
 
+def _scan_year(year: int, variables: list, data_root: str | None = None, **_) -> list[dict]:
+    """Field-level QA pre-pass for one year (§8.4) — its own task, detection only.
+
+    **A pre-pass, never a per-batch check.** The load commits ~8 parents (~128 cells) at a
+    time, so a "constant across every cell" test inside that loop compares 128 values and
+    sees nothing; the scan has to see a whole var-year first.
+
+    Split out of the load so a finding is a *task-level* event with its own log and its own
+    XCom, rather than a warning buried in the middle of a year's load output. Nothing here
+    repairs anything: findings go to the registry, and what happens next is the DAG's
+    decision, downstream.
+    """
+    import logging
+
+    from src.config import resolve_bronze_dir
+    from src.db import issues as db_issues
+    from src.db import load as db_load
+    from src.db import silver_load
+    from src.transform import field_qa, merge
+
+    log = logging.getLogger(__name__)
+    year = int(year)
+    bronze_dir = resolve_bronze_dir(data_root)
+
+    present = merge.available_variables(bronze_dir, year, variables)
+    if not present:
+        return []
+
+    findings = field_qa.scan_archive(bronze_dir, [year], present)
+    if findings.empty:
+        log.info("year %s: field QA clean over %s", year, present)
+        return []
+
+    conn = db_load.connect()
+    try:
+        silver_load.ensure_schema(conn)
+        db_issues.record_findings(conn, findings)
+    finally:
+        conn.close()
+
+    out = []
+    for finding in findings.itertuples(index=False):
+        log.warning(
+            "field QA: %s %s %s over %d cells (%s) — recorded in %s",
+            finding.variable, finding.date, finding.detector, finding.cells,
+            finding.detail, db_issues.TABLE,
+        )
+        # str dates and plain ints: this crosses an XCom, which is JSON.
+        out.append(
+            {
+                "variable": finding.variable,
+                "date": str(finding.date),
+                "detector": finding.detector,
+                "cells": int(finding.cells),
+                "year": year,
+            }
+        )
+    return out
+
+
+def _collect_repairs(**context) -> list[dict]:
+    """Turn this run's findings into one ``repair_silver`` conf per issue worth repairing.
+
+    Returns ``[]`` — which skips the trigger tasks entirely — when auto-repair is off or
+    nothing new was found. The filtering is in ``issues.select_repairable``: only a
+    ``detected`` issue qualifies, so an incident already repaired, already judged an
+    accepted source defect, or already dismissed is not re-fired on every transform.
+    """
+    import logging
+
+    from src.db import issues as db_issues
+    from src.db import load as db_load
+
+    log = logging.getLogger(__name__)
+    params = context["params"]
+    if not params.get("auto_repair"):
+        return []
+
+    scanned = context["ti"].xcom_pull(task_ids="field_qa_scan") or []
+    findings = [f for year in scanned if year for f in year]
+    if not findings:
+        return []
+
+    conn = db_load.connect()
+    try:
+        repairable = db_issues.select_repairable(findings, db_issues.fetch_all(conn))
+    finally:
+        conn.close()
+
+    dry_run = bool(params.get("auto_repair_dry_run"))
+    for target in repairable:
+        log.warning(
+            "auto-repair: triggering repair_silver for issue %s (%s %s), dry_run=%s",
+            target["issue_id"], target["variable"], target["date"], dry_run,
+        )
+    return [{"issue_id": t["issue_id"], "dry_run": dry_run, "method": "auto"}
+            for t in repairable]
+
+
 def _transform_year(
     year: int,
     variables: list,
@@ -60,10 +168,9 @@ def _transform_year(
     import pendulum as _pendulum
 
     from src.config import resolve_bronze_dir
-    from src.db import issues as db_issues
     from src.db import load as db_load
     from src.db import silver_load
-    from src.transform import field_qa, merge, qa
+    from src.transform import merge, qa
 
     log = logging.getLogger(__name__)
     year = int(year)
@@ -89,21 +196,6 @@ def _transform_year(
     try:
         silver_load.ensure_schema(conn)
 
-        # Field-level QA pre-pass (§8.4). Must run here — before the batch loop — because
-        # a "constant across every cell" test inside the loop only ever sees one batch's
-        # ~128 cells. Detection only: findings go to the registry and a WARNING, never to
-        # an automatic repair, so an upstream defect stays visible instead of being
-        # silently filled in.
-        findings = field_qa.scan_archive(bronze_dir, [year], present)
-        if not findings.empty:
-            db_issues.record_findings(conn, findings)
-            for finding in findings.itertuples(index=False):
-                log.warning(
-                    "field QA: %s %s %s over %d cells (%s) — recorded in %s",
-                    finding.variable, finding.date, finding.detector, finding.cells,
-                    finding.detail, db_issues.TABLE,
-                )
-
         for batch in merge.iter_parent_batches(
             bronze_dir, year, present, batch_size=int(parent_batch_size)
         ):
@@ -128,17 +220,8 @@ def _transform_year(
     finally:
         conn.close()
 
-    log.info(
-        "year %s done: %d rows loaded, %d quarantined, %d field-QA findings",
-        year, loaded, quarantined, len(findings),
-    )
-    return {
-        "year": year,
-        "loaded": loaded,
-        "quarantined": quarantined,
-        "field_qa_findings": len(findings),
-        "skipped": False,
-    }
+    log.info("year %s done: %d rows loaded, %d quarantined", year, loaded, quarantined)
+    return {"year": year, "loaded": loaded, "quarantined": quarantined, "skipped": False}
 
 
 with DAG(
@@ -164,12 +247,36 @@ with DAG(
         "final_cutoff": "",          # ISO date; blank = derive from preliminary_months
         "data_root": "",             # per-run data root override; blank = env DATA_DIR.
                                      # Must match the root the bronze was downloaded to.
+        # Fire repair_silver on a newly *detected* field defect. Only `detected` qualifies
+        # (issues.select_repairable), so an incident already repaired, accepted or
+        # dismissed is never re-fired. Repair is still a separate DAG with its own run and
+        # its own audit trail; this only pulls the trigger.
+        "auto_repair": True,
+        "auto_repair_dry_run": False,
     },
 ) as dag:
     plan = PythonOperator(task_id="plan", python_callable=_plan)
+    field_qa_scan = PythonOperator.partial(
+        task_id="field_qa_scan",
+        python_callable=_scan_year,
+        pool=SILVER_POOL,
+    ).expand(op_kwargs=plan.output)
     transform = PythonOperator.partial(
         task_id="transform",
         python_callable=_transform_year,
         pool=SILVER_POOL,
     ).expand(op_kwargs=plan.output)
-    plan >> transform
+    collect_repairs = PythonOperator(
+        task_id="collect_repairs", python_callable=_collect_repairs
+    )
+    # Mapped over an empty list when there is nothing to repair, which skips it.
+    auto_repair = TriggerDagRunOperator.partial(
+        task_id="auto_repair",
+        trigger_dag_id="repair_silver",
+        wait_for_completion=False,
+    ).expand(conf=collect_repairs.output)
+
+    # The scan runs first — it reads bronze, so it needs nothing from the load — but the
+    # repair runs *after* the transform, because a repair rewrites rows in wth_base and
+    # there is nothing to rewrite until the year is loaded.
+    plan >> field_qa_scan >> transform >> collect_repairs >> auto_repair
