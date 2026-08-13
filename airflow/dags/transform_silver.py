@@ -60,9 +60,10 @@ def _transform_year(
     import pendulum as _pendulum
 
     from src.config import resolve_bronze_dir
+    from src.db import issues as db_issues
     from src.db import load as db_load
     from src.db import silver_load
-    from src.transform import merge, qa
+    from src.transform import field_qa, merge, qa
 
     log = logging.getLogger(__name__)
     year = int(year)
@@ -87,6 +88,22 @@ def _transform_year(
     loaded = quarantined = 0
     try:
         silver_load.ensure_schema(conn)
+
+        # Field-level QA pre-pass (§8.4). Must run here — before the batch loop — because
+        # a "constant across every cell" test inside the loop only ever sees one batch's
+        # ~128 cells. Detection only: findings go to the registry and a WARNING, never to
+        # an automatic repair, so an upstream defect stays visible instead of being
+        # silently filled in.
+        findings = field_qa.scan_archive(bronze_dir, [year], present)
+        if not findings.empty:
+            db_issues.record_findings(conn, findings)
+            for finding in findings.itertuples(index=False):
+                log.warning(
+                    "field QA: %s %s %s over %d cells (%s) — recorded in %s",
+                    finding.variable, finding.date, finding.detector, finding.cells,
+                    finding.detail, db_issues.TABLE,
+                )
+
         for batch in merge.iter_parent_batches(
             bronze_dir, year, present, batch_size=int(parent_batch_size)
         ):
@@ -111,8 +128,17 @@ def _transform_year(
     finally:
         conn.close()
 
-    log.info("year %s done: %d rows loaded, %d quarantined", year, loaded, quarantined)
-    return {"year": year, "loaded": loaded, "quarantined": quarantined, "skipped": False}
+    log.info(
+        "year %s done: %d rows loaded, %d quarantined, %d field-QA findings",
+        year, loaded, quarantined, len(findings),
+    )
+    return {
+        "year": year,
+        "loaded": loaded,
+        "quarantined": quarantined,
+        "field_qa_findings": len(findings),
+        "skipped": False,
+    }
 
 
 with DAG(
