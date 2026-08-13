@@ -320,6 +320,25 @@ Re-running a year that is already loaded is **safe and expected**: the upsert re
 same `(parent_id, child_id, date)` rows and bumps `ingested_at`. There is no need to clear
 anything first.
 
+> **A repaired cell-day is also never re-quarantined.** The same re-transform recomputes
+> the failing `et0` from the same corrupt bronze, so `record_failures` would file 638
+> cell-days that are sitting in `wth_base`, repaired and untouched by that run — a
+> quarantine entry contradicting the row it points at. It purges those on the way in
+> (`wth_base.imputed > 0`); the unrepaired-source debt stays visible in `wth_data_issues`
+> as `refetch_pending`, which is where it belongs.
+>
+> **Repaired values are the one exception, and they are protected.** Bronze stays corrupt
+> after a field repair (§4b) — only silver was fixed — so a plain overwrite would put the
+> bad value back and clear the flag, silently. `upsert_wide` guards each column with its own
+> `wth_base.imputed` bit, so a re-transform of 1981/1987/1998 leaves the repaired columns
+> and their flags alone and rewrites everything else. When a clean re-fetch finally arrives,
+> clear the flag first — that is the deliberate act that lets real data land:
+>
+> ```python
+> from src.db import issues
+> issues.clear_imputed(conn, "tmin", date(1987, 1, 26), parents=[...])  # then re-transform
+> ```
+
 ### Adding a new region (e.g. Honduras) — read this first
 
 Bronze files are keyed `<variable>_<year>.parquet` with **no region in the name**, and the
@@ -375,6 +394,215 @@ SELECT t_zone, count(*) FROM era5_land_base_grid WHERE is_land GROUP BY 1 ORDER 
 > years you already downloaded is skipped as "done". `data_root` sidesteps it by giving each
 > region its own manifest file — keep using separate roots until region is baked into the
 > key itself.
+
+---
+
+## 4b. Field QA scan and repair (Step 4b)
+
+Row-level QA (`qa.CHECKS`) validates one row against physics. It cannot see a field that is
+*uniformly* wrong: on 1987-01-26 every cell in the archive carried the identical `tmin`, and
+every value was individually plausible. `qa_scan` finds that class of defect; `repair_silver`
+fixes it. Both are offline — no CDS, no GEE, no quota.
+
+**Detection is automatic, and so is the first repair.** `transform_silver` runs the scan as
+its own task (`field_qa_scan`), records findings, and then — via `collect_repairs` →
+`auto_repair` — triggers `repair_silver` for any issue still at status `detected`:
+
+```
+plan → field_qa_scan (per year) → transform (per year) → collect_repairs → auto_repair
+```
+
+The scan is first (it reads bronze); the repair is last (it rewrites `wth_base` rows that
+do not exist until the year is loaded). Two guards keep this from running away:
+
+- **Only `detected` fires.** `refetch_pending`, `imputed`, `accepted_source_defect` and
+  `false_positive` are decisions already made, so the same incident is never re-repaired —
+  otherwise every transform would re-estimate an estimate from its own output.
+- **`auto_repair: false`** turns it off entirely; **`auto_repair_dry_run: true`** fires the
+  repair DAG in dry-run mode, which logs the diff and writes nothing.
+
+> **This is a deliberate departure from D5**, which argued repair must always be a human
+> decision — silent imputation is how an upstream defect stops being visible. What keeps it
+> honest here: every filled value carries its `imputed` bit and a `wth_imputation_log` row
+> with the original, the issue lands on `refetch_pending` rather than resolved, and the
+> repair still runs as its own DAG run with its own logs. The defect stays on the books;
+> only the first response is automatic.
+
+### Step 1 — scan
+
+Also applies the new DDL (`wth_base.imputed`, `wth_data_issues`, `wth_imputation_log`) via
+`ensure_schema`, so there is no separate migration step. The `ALTER TABLE` is metadata-only
+on PG 16 — instant, even at 172M rows.
+
+```bash
+docker compose run --rm airflow-scheduler \
+  airflow dags trigger qa_scan
+```
+
+| Param | Default | Notes |
+|---|---|---|
+| `start_year` / `end_year` | 1981 / 2026 | one mapped task per **variable**, each covering the range |
+| `variables` | all 7 | from the download contract — CHIRPS under `bronze/` is out of scope |
+| `record` | `true` | `false` = log findings without touching the registry |
+
+Takes ~40 min over the full archive (973 files, two columns each). Then read the registry:
+
+```sql
+SELECT issue_id, variable, date, detector, cells, status,
+       detail->>'min' AS min_value
+FROM wth_data_issues ORDER BY variable, date;
+```
+
+Expected on the current archive — **exactly three**, no more:
+
+| variable | date | cells | value |
+|---|---|---|---|
+| `precip` | 1998-05-19 | 412 | 19.0 mm |
+| `tmin` | 1981-08-11 | 412 | −7.71 °C |
+| `tmin` | 1987-01-26 | 9,842 | −5.49 °C |
+
+A fourth `precip` row means the magnitude gate regressed; a CHIRPS row means the variable
+scoping did.
+
+> **The scan reads bronze, so it cannot see every silver defect.** 341 of silver's 10,183
+> cells have no bronze source (they predate the LatAm backfill and come from the legacy
+> archive). A defect confined to those cells — as `tmin` 1987-01-25 turned out to be — never
+> appears in a `qa_scan` result and has to be registered by hand against `wth_base`. Check
+> for that class with a query over silver, not with the scan:
+>
+> ```sql
+> SELECT date, tmin, count(*) FROM wth_base
+> WHERE date BETWEEN '1987-01-20' AND '1987-01-31'
+> GROUP BY 1,2 HAVING count(*) > 100 ORDER BY 3 DESC;
+> ```
+
+### Step 2 — dry run
+
+`dry_run` is the default, so this writes nothing. It prints the before/after diff per batch.
+
+```bash
+docker compose run --rm airflow-scheduler \
+  airflow dags trigger repair_silver -c '{"issue_id": 3}'
+```
+
+Read the `apply` task log and check the `new_value` column looks like weather — for
+1987-01-26 the flanking days sit at 21–22 °C, so anything near −5 means the repair did not
+take.
+
+| Param | Default | Notes |
+|---|---|---|
+| `issue_id` | `""` | from `wth_data_issues`; or give `variable` + `date` instead |
+| `method` | `auto` | walks that variable's ladder (`repair.LADDER`) |
+| `seed` | 0 | analog-day draw — the same seed reproduces the same donor day |
+| `dry_run` | `true` | **set `false` to actually write** |
+| `recompute_only` | `false` | skip the ladder, only re-derive `rh`/`et0` for cell-days already repaired — for issues repaired before the recompute existed. A plain re-run cannot do it: the ladder scopes a `constant_field` incident by its corrupt value, which is exactly what the repair removed, so it finds no targets. The parent list comes from `wth_imputation_log` instead |
+| `parent_batch_size` | 64 | parents per batch. Do not raise it much further — the write is a partition-pruned `UPDATE`, and a batch spanning too many parents starts to look like a table scan to the planner |
+
+### Step 3 — apply
+
+```bash
+docker compose run --rm airflow-scheduler \
+  airflow dags trigger repair_silver -c '{"issue_id": 3, "dry_run": false}'
+```
+
+Per issue this writes the repaired values **one column at a time** (never `upsert_wide`,
+which would null out the other seven variables), sets the `imputed` bit, writes a
+`wth_imputation_log` row holding the **original** value, reinstates that date's quarantined
+cell-days from `wth_qa_failures`, re-derives `rh` and `et0`, and moves the registry row to
+`refetch_pending`.
+
+**`rh` and `et0` are recomputed, not left alone.** Tetens takes `(tmax+tmin)/2`, so a
+corrupt −5.49 °C `tmin` deflates `es(tmean)` and *inflates* `rh` — some of it clipping at
+100 — and drags `et0` with it. Repairing `tmin` without re-deriving them leaves a row whose
+temperature is right and whose humidity and evaporative demand still describe the defect,
+which is the hardest kind of wrong to notice. The recompute runs in the same transaction,
+goes through `merge.add_derived` (the same code path the transform uses), sets bits 64/128,
+and logs each value as `derived_from(<variable>)`. It is skipped for `precip`, which feeds
+neither formula.
+
+**The registry lands on `refetch_pending`, not `imputed`.** Every rung implemented today is
+an estimate, and `imputed` counts as resolved — the issue would vanish from
+`issues.fetch_open()` and the owed re-fetch would survive only as a log line. Reserve
+`imputed` for a repair with nothing outstanding. Standing check for open debt:
+
+```sql
+SELECT issue_id, variable, date, status, resolution FROM wth_data_issues
+WHERE status NOT IN ('refetched','imputed','accepted_source_defect','false_positive');
+```
+
+Repeat for the second `tmin` issue. **Leave the `precip` one for last and decide it by
+inspection** — 19 mm uniform is clearly wrong, but whether the real day was wet or dry needs
+a source this project has not wired yet (CHIRPS, on the `chirps-fine-grid` branch). Mark it
+`accepted_source_defect` rather than guessing:
+
+```sql
+UPDATE wth_data_issues SET status = 'accepted_source_defect',
+       resolution = 'no independent source available; left as-is', resolved_at = now()
+WHERE issue_id = 1;
+```
+
+### Verify
+
+```sql
+-- distinct values back in the flanking-day range, not 1
+SELECT date, count(*) rows, count(DISTINCT tmin) distinct_tmin, min(tmin)
+FROM wth_base WHERE date IN ('1987-01-25','1987-01-26','1987-01-27',
+                             '1981-08-10','1981-08-11','1981-08-12')
+GROUP BY date ORDER BY date;
+
+-- 1987 back to its full calendar: 10,183 x 365 = 3,716,795
+SELECT count(*) FROM wth_base WHERE date >= '1987-01-01' AND date < '1988-01-01';
+
+-- every repair reversible: original value retained
+SELECT variable, date, method, count(*), min(original_value), min(new_value)
+FROM wth_imputation_log GROUP BY 1,2,3;
+
+-- no repaired input left with a derived column that still describes the defect:
+-- every tmin-repaired cell-day must also carry the rh (64) and et0 (128) bits
+SELECT date, count(*) FILTER (WHERE imputed & 2 > 0) tmin_repaired,
+       count(*) FILTER (WHERE imputed & 2 > 0 AND imputed & 192 <> 192) missing_derived
+FROM wth_base WHERE date IN ('1987-01-25','1987-01-26','1981-08-11')
+GROUP BY date ORDER BY date;
+```
+
+`missing_derived` must be 0 on every row.
+
+Before the repair those dates show `distinct_tmin` of 340 and 7,895 with a `min` near −5.49
+/ −7.71, and 1987 holds 3,716,075 rows (720 short). After, no cell on either date has
+`tmin < 0`.
+
+### Quarantined rows a later fix makes valid
+
+A row-level check that turns out to be too strict leaves a permanent hole: the rows sit in
+`wth_qa_failures` and never reach `wth_base`. 2010-07-18 was the case — 4 cells rejected by
+`et0<0` when FAO-56 legitimately returns a small negative ET0 under saturation (rh 100,
+srad ~0.58 MJ, wind ~7 m/s). `et0.snap_negative_et0` fixed it going forward only. Reinstate
+the old rows with the same clamp; **do not** set an `imputed` bit — the value is a physical
+zero, not an estimate, and the bit would freeze the row against any later re-transform.
+
+```sql
+BEGIN;
+INSERT INTO wth_base (parent_id, child_id, date, tmax, tmin, precip, srad, wind, tdew,
+                      rh, et0, is_preliminary, imputed)
+SELECT parent_id, child_id, date, tmax, tmin, precip, srad, wind, tdew, rh,
+       CASE WHEN et0 < 0 AND et0 >= -0.1 THEN 0 ELSE et0 END, FALSE, 0
+FROM wth_qa_failures WHERE date = DATE '2010-07-18' AND reason = 'et0<0'
+ON CONFLICT (parent_id, child_id, date) DO NOTHING;
+DELETE FROM wth_qa_failures WHERE date = DATE '2010-07-18' AND reason = 'et0<0';
+COMMIT;
+```
+
+Record it in the registry as `false_positive` with the original values in `detail` — the
+quarantine row is the only copy, and the `DELETE` is what makes it the last one. The check
+was wrong, the source was not, so `accepted_source_defect` would misfile it.
+
+> **These repairs are estimates, not fixes.** No date-scoped download exists in either
+> backend yet (the CDS splitter floors at one month, GEE exports whole years), so the true
+> first rung — re-fetch from an independent source — is not available. That is why the
+> original value is logged: when sub-year re-fetch lands with the `update` DAG (Step 5),
+> every imputation here can be replaced with real data.
+
+---
 
 ## 5. Inspect it in DBeaver
 
