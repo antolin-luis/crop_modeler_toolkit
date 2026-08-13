@@ -11,6 +11,7 @@ import numpy as np
 import pytest
 
 from src.transform.et0 import (
+    ET0_NEGATIVE_TOLERANCE,
     atm_pressure,
     clear_sky_radiation,
     delta_svp,
@@ -20,6 +21,7 @@ from src.transform.et0 import (
     net_radiation,
     net_shortwave,
     psychrometric_gamma,
+    snap_negative_et0,
     wind_2m,
 )
 
@@ -122,3 +124,42 @@ def test_et0_vectorized_matches_scalar():
         float(et0_fao56(**{**BASE, "doy": int(d)})) for d in kwargs["doy"]
     ]
     assert np.allclose(vector, scalars)
+
+
+# --- negative-ET0 clamp (§8.4) ---------------------------------------------------------
+
+
+def test_saturation_edge_case_clamps_to_zero_instead_of_quarantining():
+    """The real 2010-07-18 rows — the only `et0<0` quarantine in the archive.
+
+    Saturated (rh 100), near-zero radiation, breezy: FAO-56 genuinely returns a small
+    negative. The physical answer is zero evaporative demand, so these must load rather
+    than fail the `et0<0` check. Inputs and pre-clamp outputs are the live quarantine rows
+    for cells F6HX / F6HY / F7LW / F7LX.
+    """
+    observed = [
+        # tmax, tmin, srad, wind10, tdew, lat, elevation, et0 before the clamp
+        (12.832911, 6.754785, 0.5872401, 6.9082646, 10.951593, -32.75, 225.0078, -0.0427),
+        (12.763147, 7.254785, 0.5949299, 6.6830950, 11.092463, -32.75, 219.3460, -0.0234),
+        (12.600763, 5.7018676, 0.5805041, 7.5639670, 10.374140, -33.00, 209.9957, -0.0638),
+        (12.838343, 6.0704894, 0.5700210, 6.8585196, 10.677698, -33.00, 174.3100, -0.0434),
+    ]
+    for tmax, tmin, srad, wind10, tdew, lat, elevation, pre_clamp in observed:
+        value = float(et0_fao56(tmax=tmax, tmin=tmin, srad=srad, wind10=wind10, tdew=tdew,
+                                elevation=elevation, lat_deg=lat, doy=199))
+        assert value == 0.0
+        # The equation itself is unchanged — these sit inside the clamp band, which is
+        # why the clamp (not a different ET0) is what lets them load.
+        assert -ET0_NEGATIVE_TOLERANCE < pre_clamp < 0.0
+
+
+def test_snap_leaves_positive_and_large_negative_values_alone():
+    out = snap_negative_et0(np.array([2.5, -0.023, -0.064, -1.5, 0.0]))
+    # Sub-tolerance negatives become zero; a large negative survives to fail QA.
+    assert np.array_equal(out, np.array([2.5, 0.0, 0.0, -1.5, 0.0]))
+    assert ET0_NEGATIVE_TOLERANCE == 0.1
+
+
+def test_snap_preserves_nan():
+    # §8.3: a missing input stays NULL, it does not become a zero.
+    assert np.isnan(snap_negative_et0(np.array([np.nan]))[0])
