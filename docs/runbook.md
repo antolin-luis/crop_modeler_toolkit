@@ -320,6 +320,25 @@ Re-running a year that is already loaded is **safe and expected**: the upsert re
 same `(parent_id, child_id, date)` rows and bumps `ingested_at`. There is no need to clear
 anything first.
 
+> **A repaired cell-day is also never re-quarantined.** The same re-transform recomputes
+> the failing `et0` from the same corrupt bronze, so `record_failures` would file 638
+> cell-days that are sitting in `wth_base`, repaired and untouched by that run — a
+> quarantine entry contradicting the row it points at. It purges those on the way in
+> (`wth_base.imputed > 0`); the unrepaired-source debt stays visible in `wth_data_issues`
+> as `refetch_pending`, which is where it belongs.
+>
+> **Repaired values are the one exception, and they are protected.** Bronze stays corrupt
+> after a field repair (§4b) — only silver was fixed — so a plain overwrite would put the
+> bad value back and clear the flag, silently. `upsert_wide` guards each column with its own
+> `wth_base.imputed` bit, so a re-transform of 1981/1987/1998 leaves the repaired columns
+> and their flags alone and rewrites everything else. When a clean re-fetch finally arrives,
+> clear the flag first — that is the deliberate act that lets real data land:
+>
+> ```python
+> from src.db import issues
+> issues.clear_imputed(conn, "tmin", date(1987, 1, 26), parents=[...])  # then re-transform
+> ```
+
 ### Adding a new region (e.g. Honduras) — read this first
 
 Bronze files are keyed `<variable>_<year>.parquet` with **no region in the name**, and the
@@ -385,9 +404,29 @@ Row-level QA (`qa.CHECKS`) validates one row against physics. It cannot see a fi
 every value was individually plausible. `qa_scan` finds that class of defect; `repair_silver`
 fixes it. Both are offline — no CDS, no GEE, no quota.
 
-**Detection is automatic, repair is not.** `transform_silver` now runs the same scan as a
-pre-pass and records findings, but nothing is ever auto-filled. Silent imputation is how an
-upstream data defect stops being visible.
+**Detection is automatic, and so is the first repair.** `transform_silver` runs the scan as
+its own task (`field_qa_scan`), records findings, and then — via `collect_repairs` →
+`auto_repair` — triggers `repair_silver` for any issue still at status `detected`:
+
+```
+plan → field_qa_scan (per year) → transform (per year) → collect_repairs → auto_repair
+```
+
+The scan is first (it reads bronze); the repair is last (it rewrites `wth_base` rows that
+do not exist until the year is loaded). Two guards keep this from running away:
+
+- **Only `detected` fires.** `refetch_pending`, `imputed`, `accepted_source_defect` and
+  `false_positive` are decisions already made, so the same incident is never re-repaired —
+  otherwise every transform would re-estimate an estimate from its own output.
+- **`auto_repair: false`** turns it off entirely; **`auto_repair_dry_run: true`** fires the
+  repair DAG in dry-run mode, which logs the diff and writes nothing.
+
+> **This is a deliberate departure from D5**, which argued repair must always be a human
+> decision — silent imputation is how an upstream defect stops being visible. What keeps it
+> honest here: every filled value carries its `imputed` bit and a `wth_imputation_log` row
+> with the original, the issue lands on `refetch_pending` rather than resolved, and the
+> repair still runs as its own DAG run with its own logs. The defect stays on the books;
+> only the first response is automatic.
 
 ### Step 1 — scan
 
@@ -456,6 +495,7 @@ take.
 | `method` | `auto` | walks that variable's ladder (`repair.LADDER`) |
 | `seed` | 0 | analog-day draw — the same seed reproduces the same donor day |
 | `dry_run` | `true` | **set `false` to actually write** |
+| `recompute_only` | `false` | skip the ladder, only re-derive `rh`/`et0` for cell-days already repaired — for issues repaired before the recompute existed. A plain re-run cannot do it: the ladder scopes a `constant_field` incident by its corrupt value, which is exactly what the repair removed, so it finds no targets. The parent list comes from `wth_imputation_log` instead |
 | `parent_batch_size` | 64 | parents per batch. Do not raise it much further — the write is a partition-pruned `UPDATE`, and a batch spanning too many parents starts to look like a table scan to the planner |
 
 ### Step 3 — apply
@@ -467,8 +507,28 @@ docker compose run --rm airflow-scheduler \
 
 Per issue this writes the repaired values **one column at a time** (never `upsert_wide`,
 which would null out the other seven variables), sets the `imputed` bit, writes a
-`wth_imputation_log` row holding the **original** value, moves the registry row to
-`imputed`, and reinstates that date's quarantined cell-days from `wth_qa_failures`.
+`wth_imputation_log` row holding the **original** value, reinstates that date's quarantined
+cell-days from `wth_qa_failures`, re-derives `rh` and `et0`, and moves the registry row to
+`refetch_pending`.
+
+**`rh` and `et0` are recomputed, not left alone.** Tetens takes `(tmax+tmin)/2`, so a
+corrupt −5.49 °C `tmin` deflates `es(tmean)` and *inflates* `rh` — some of it clipping at
+100 — and drags `et0` with it. Repairing `tmin` without re-deriving them leaves a row whose
+temperature is right and whose humidity and evaporative demand still describe the defect,
+which is the hardest kind of wrong to notice. The recompute runs in the same transaction,
+goes through `merge.add_derived` (the same code path the transform uses), sets bits 64/128,
+and logs each value as `derived_from(<variable>)`. It is skipped for `precip`, which feeds
+neither formula.
+
+**The registry lands on `refetch_pending`, not `imputed`.** Every rung implemented today is
+an estimate, and `imputed` counts as resolved — the issue would vanish from
+`issues.fetch_open()` and the owed re-fetch would survive only as a log line. Reserve
+`imputed` for a repair with nothing outstanding. Standing check for open debt:
+
+```sql
+SELECT issue_id, variable, date, status, resolution FROM wth_data_issues
+WHERE status NOT IN ('refetched','imputed','accepted_source_defect','false_positive');
+```
 
 Repeat for the second `tmin` issue. **Leave the `precip` one for last and decide it by
 inspection** — 19 mm uniform is clearly wrong, but whether the real day was wet or dry needs
@@ -496,11 +556,45 @@ SELECT count(*) FROM wth_base WHERE date >= '1987-01-01' AND date < '1988-01-01'
 -- every repair reversible: original value retained
 SELECT variable, date, method, count(*), min(original_value), min(new_value)
 FROM wth_imputation_log GROUP BY 1,2,3;
+
+-- no repaired input left with a derived column that still describes the defect:
+-- every tmin-repaired cell-day must also carry the rh (64) and et0 (128) bits
+SELECT date, count(*) FILTER (WHERE imputed & 2 > 0) tmin_repaired,
+       count(*) FILTER (WHERE imputed & 2 > 0 AND imputed & 192 <> 192) missing_derived
+FROM wth_base WHERE date IN ('1987-01-25','1987-01-26','1981-08-11')
+GROUP BY date ORDER BY date;
 ```
+
+`missing_derived` must be 0 on every row.
 
 Before the repair those dates show `distinct_tmin` of 340 and 7,895 with a `min` near −5.49
 / −7.71, and 1987 holds 3,716,075 rows (720 short). After, no cell on either date has
 `tmin < 0`.
+
+### Quarantined rows a later fix makes valid
+
+A row-level check that turns out to be too strict leaves a permanent hole: the rows sit in
+`wth_qa_failures` and never reach `wth_base`. 2010-07-18 was the case — 4 cells rejected by
+`et0<0` when FAO-56 legitimately returns a small negative ET0 under saturation (rh 100,
+srad ~0.58 MJ, wind ~7 m/s). `et0.snap_negative_et0` fixed it going forward only. Reinstate
+the old rows with the same clamp; **do not** set an `imputed` bit — the value is a physical
+zero, not an estimate, and the bit would freeze the row against any later re-transform.
+
+```sql
+BEGIN;
+INSERT INTO wth_base (parent_id, child_id, date, tmax, tmin, precip, srad, wind, tdew,
+                      rh, et0, is_preliminary, imputed)
+SELECT parent_id, child_id, date, tmax, tmin, precip, srad, wind, tdew, rh,
+       CASE WHEN et0 < 0 AND et0 >= -0.1 THEN 0 ELSE et0 END, FALSE, 0
+FROM wth_qa_failures WHERE date = DATE '2010-07-18' AND reason = 'et0<0'
+ON CONFLICT (parent_id, child_id, date) DO NOTHING;
+DELETE FROM wth_qa_failures WHERE date = DATE '2010-07-18' AND reason = 'et0<0';
+COMMIT;
+```
+
+Record it in the registry as `false_positive` with the original values in `detail` — the
+quarantine row is the only copy, and the `DELETE` is what makes it the last one. The check
+was wrong, the source was not, so `accepted_source_defect` would misfile it.
 
 > **These repairs are estimates, not fixes.** No date-scoped download exists in either
 > backend yet (the CDS splitter floors at one month, GEE exports whole years), so the true

@@ -14,6 +14,9 @@ from src.transform import field_qa
 
 
 class FakeCursor:
+    # rowcount is what clear_imputed reports back; psycopg2 sets it after execute().
+    rowcount = 2
+
     def __init__(self, log, rows=None):
         self.log = log
         self._rows = rows or []
@@ -164,6 +167,79 @@ def test_fetch_open_excludes_resolved_states():
     sql, params = conn.log[0]
     assert "WHERE status NOT IN %s" in sql
     assert set(params[0]) == issues.RESOLVED_STATUSES
+
+
+def _registry(*rows) -> pd.DataFrame:
+    return pd.DataFrame(list(rows), columns=["issue_id", "variable", "date", "status"])
+
+
+def test_select_repairable_only_fires_on_a_new_detection():
+    """The scan re-runs on every transform, so anything already triaged must not re-fire —
+    an estimate re-repaired from its own estimate is worse than no repair at all."""
+    registry = _registry(
+        (1, "tmin", date(1987, 1, 26), issues.STATUS_DETECTED),
+        (2, "tmin", date(1981, 8, 11), issues.STATUS_REFETCH_PENDING),
+        (3, "precip", date(1998, 5, 19), issues.STATUS_ACCEPTED_SOURCE_DEFECT),
+        (4, "srad", date(2001, 3, 3), issues.STATUS_FALSE_POSITIVE),
+    )
+    findings = [
+        {"variable": "tmin", "date": "1987-01-26"},
+        {"variable": "tmin", "date": "1981-08-11"},
+        {"variable": "precip", "date": "1998-05-19"},
+        {"variable": "srad", "date": "2001-03-03"},
+    ]
+
+    assert issues.select_repairable(findings, registry) == [
+        {"variable": "tmin", "date": "1987-01-26", "issue_id": 1}
+    ]
+
+
+def test_select_repairable_dedupes_per_file_findings():
+    # One incident, reported once per bronze chunk and per detector — but one repair.
+    registry = _registry((1, "tmin", date(1987, 1, 26), issues.STATUS_DETECTED))
+    findings = [
+        {"variable": "tmin", "date": "1987-01-26", "detector": "constant_field"},
+        {"variable": "tmin", "date": "1987-01-26", "detector": "low_spread"},
+    ]
+
+    assert len(issues.select_repairable(findings, registry)) == 1
+
+
+def test_select_repairable_ignores_a_finding_with_no_registry_row():
+    assert issues.select_repairable(
+        [{"variable": "tmin", "date": "1987-01-26"}], _registry().iloc[0:0]
+    ) == []
+
+
+def test_clear_imputed_zeroes_the_bit_and_drops_the_log():
+    """The escape hatch for a clean re-fetch: upsert_wide will not overwrite a flagged
+    column, so replacing an estimate with real data means clearing the flag first."""
+    conn = FakeConn()
+    cleared = issues.clear_imputed(conn, "tmin", date(1987, 1, 26))
+
+    assert cleared == 2
+    update, delete = conn.log[0][0], conn.log[1][0]
+    assert "UPDATE wth_base SET imputed = imputed & %s::smallint" in update
+    assert "imputed & 2 > 0" in update
+    # 0xFF ^ 2 — the complement inside the byte the bitmask occupies, so the other seven
+    # variables' flags survive.
+    assert conn.log[0][1][0] == 0xFD
+    assert delete.startswith("DELETE FROM wth_imputation_log")
+    assert conn.commits == 1
+
+
+def test_clear_imputed_scopes_to_parents_so_partitions_prune():
+    conn = FakeConn()
+    issues.clear_imputed(conn, "tmin", date(1987, 1, 26), parents=["0Y4H", "0YEH"])
+
+    for sql, params in conn.log:
+        assert "parent_id = ANY(%s::bpchar[])" in sql
+        assert params[-1] == ["0Y4H", "0YEH"]
+
+
+def test_clear_imputed_rejects_a_non_value_column():
+    with pytest.raises(ValueError, match="not a wth_base value column"):
+        issues.clear_imputed(FakeConn(), "elevation", date(1987, 1, 26))
 
 
 def test_registry_statuses_are_documented_in_the_ddl():

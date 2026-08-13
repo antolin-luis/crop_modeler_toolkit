@@ -6,14 +6,16 @@ that changes a stored value, and it has to be triggered deliberately with an exp
 scope. Had the pipeline auto-filled instead, nobody would ever have learned that ERA5-Land
 ships a corrupt band — the defect would have been quietly averaged away.
 
-Three things happen together or not at all, per parent batch:
+Four things happen together or not at all, per parent batch:
 
 1. the repaired values are written **one column at a time** (``silver_load.update_column``
    — never ``upsert_wide``, which would null out the other seven variables),
 2. every changed cell-day gets a ``wth_imputation_log`` row holding its *original* value,
    so the repair is reversible when a clean source appears,
 3. cell-days that were quarantined for this date are reinstated into ``wth_base``, because
-   a corrupt field leaves both wrong rows *and* a hole (712 cells on 1987-01-26).
+   a corrupt field leaves both wrong rows *and* a hole (712 cells on 1987-01-26),
+4. ``rh`` and ``et0`` are re-derived from the repaired inputs, because a row whose derived
+   columns still describe the defect is wrong in the hardest way to notice.
 
 ``dry_run`` is the default: it prints the diff and writes nothing.
 """
@@ -39,6 +41,19 @@ CLIMATOLOGY_WINDOW_DAYS = 7
 # compares equal. Half a millikelvin is far tighter than any real spread between cells and
 # far looser than the float4 rounding gap.
 VALUE_MATCH_TOLERANCE = 5e-4
+
+# Variables that feed Tetens RH (§12.1) and FAO-56 ET0 (§12.2). Repairing one of them
+# leaves `rh` and `et0` describing the value that was just replaced — and wrongly, not
+# merely staler: Tetens takes (tmax+tmin)/2, so a corrupt −5.49 °C tmin deflates es(tmean)
+# and *inflates* rh, some of it clipping at 100. A repaired row whose derived columns still
+# come from the defect is exactly the plausible-looking-but-wrong shape this whole module
+# exists to end, so they are recomputed in the same transaction. `precip` feeds neither.
+DERIVED_INPUTS = frozenset({"tmax", "tmin", "tdew", "srad", "wind"})
+DERIVED_COLUMNS = ("rh", "et0")
+
+# The full observation row: every ET0/RH input plus the two derived columns.
+WIDE_COLUMNS = ["parent_id", "child_id", "date", "tmax", "tmin", "precip",
+                "srad", "wind", "tdew", "rh", "et0"]
 
 
 def _resolve(**context) -> list[dict]:
@@ -78,6 +93,7 @@ def _resolve(**context) -> list[dict]:
             "method": params["method"],
             "seed": int(params["seed"]),
             "dry_run": bool(params["dry_run"]),
+            "recompute_only": bool(params["recompute_only"]),
             "parent_batch_size": int(params["parent_batch_size"]),
         }
         for row in found.itertuples(index=False)
@@ -109,6 +125,7 @@ def _repair(
     method: str = "auto",
     seed: int = 0,
     dry_run: bool = True,
+    recompute_only: bool = False,
     parent_batch_size: int = 8,
 ) -> dict:
     import logging
@@ -122,9 +139,20 @@ def _repair(
     target = date_cls.fromisoformat(date)
     conn = db_load.connect()
 
-    updated = reinstated = logged = 0
+    updated = reinstated = logged = rederived = 0
     try:
         silver_load.ensure_schema(conn)
+
+        if recompute_only:
+            rederived = _recompute_only(
+                conn, issue_id, variable, target, parent_batch_size, dry_run
+            )
+            log.info("issue %s: %d derived values recomputed", issue_id, rederived)
+            return {
+                "issue_id": issue_id, "variable": variable, "date": date,
+                "updated": 0, "reinstated": 0, "logged": 0,
+                "rederived": rederived, "dry_run": dry_run,
+            }
 
         # Every date already known to be bad for this variable — they must not anchor an
         # interpolation or contribute to a climatology.
@@ -200,6 +228,8 @@ def _repair(
                 batch_reinstated = _reinstate_quarantined(
                     conn, batch, target, variable, values, issue_id, applied
                 )
+                # After the reinstatement, so the rows it just put back are re-derived too.
+                batch_derived = _recompute_derived(conn, batch, target, variable, issue_id)
                 conn.commit()
             except Exception:
                 conn.rollback()
@@ -209,16 +239,23 @@ def _repair(
             updated += batch_updated
             logged += batch_logged
             reinstated += batch_reinstated
+            rederived += batch_derived
 
         if not dry_run:
+            # `refetch_pending`, not `imputed`: every rung implemented today is an
+            # estimate, and `imputed` counts as resolved, so `fetch_open` would stop
+            # listing the issue and the owed re-fetch would survive only as a log line
+            # nobody reads twice. No date-scoped download exists in either backend yet
+            # (the CDS splitter floors at one month, GEE exports whole years), so the debt
+            # is real and stays visible until Step 5 can settle it.
             db_issues.set_status(
                 conn,
                 issue_id,
-                db_issues.STATUS_IMPUTED,
-                f"{updated} cells repaired; {reinstated} reinstated",
+                db_issues.STATUS_REFETCH_PENDING,
+                f"{updated} cells repaired this run, {reinstated} reinstated, "
+                f"{rederived} derived values recomputed; "
+                f"{_logged_total(conn, issue_id)} cell-days logged for this issue",
             )
-            # The value is usable but an independent source is still owed — no date-scoped
-            # download exists in either backend yet, so this stays visible as open work.
             log.warning(
                 "issue %s repaired by estimation; a clean-source re-fetch is still owed",
                 issue_id,
@@ -229,7 +266,7 @@ def _repair(
     return {
         "issue_id": issue_id, "variable": variable, "date": date,
         "updated": updated, "reinstated": reinstated, "logged": logged,
-        "dry_run": dry_run,
+        "rederived": rederived, "dry_run": dry_run,
     }
 
 
@@ -378,6 +415,135 @@ def _fetch_current(conn, parents, variable, target):
     return frame
 
 
+def _recompute_derived(conn, parents, target, variable, issue_id) -> int:
+    """Re-derive ``rh`` and ``et0`` for the cell-days this repair just rewrote.
+
+    Scoped by the ``imputed`` bit rather than by a cell list, so it covers the reinstated
+    rows too — those come back carrying the ``rh``/``et0`` that ``wth_qa_failures`` froze
+    at quarantine time, computed from the corrupt input.
+
+    Derivation goes through ``merge.add_derived``, the same code path the transform uses,
+    so a repaired row is derived identically to an observed one — including its handling of
+    cells with no grid metadata, which get a NULL ``et0`` rather than a wrong one. Both
+    columns get their own ``imputed`` bit and their own log row (``derived_from(...)``), so
+    a consumer can tell an ET0 derived from an estimate from an observed one.
+
+    Caller owns the transaction: this must land with the repair that made it necessary.
+    """
+    import pandas as pd
+
+    from src.db import silver_load
+    from src.transform import merge
+
+    if variable not in DERIVED_INPUTS:
+        return 0
+
+    bit = silver_load.IMPUTED_BITS[variable]
+    with conn.cursor() as cur:
+        cur.execute(
+            f"SELECT {', '.join(WIDE_COLUMNS)} FROM wth_base "
+            f"WHERE parent_id = ANY(%s::bpchar[]) AND date = %s AND imputed & {bit} > 0",
+            (list(parents), target),
+        )
+        rows = cur.fetchall()
+
+    if not rows:
+        return 0
+
+    frame = pd.DataFrame(rows, columns=WIDE_COLUMNS)
+    for column in ("parent_id", "child_id"):
+        frame[column] = frame[column].str.strip()
+
+    meta = silver_load.fetch_cell_meta(conn, parents)
+    derived = merge.add_derived(frame.drop(columns=list(DERIVED_COLUMNS)), meta)
+
+    keys = ["parent_id", "child_id", "date"]
+    originals = frame.set_index(keys)
+    index = pd.MultiIndex.from_frame(derived[keys])
+
+    written = 0
+    for column in DERIVED_COLUMNS:
+        written += silver_load.update_column(
+            conn,
+            column,
+            derived[keys].assign(value=derived[column]),
+            commit=False,
+        )
+        silver_load.record_imputations(
+            conn,
+            derived[keys].assign(
+                variable=column,
+                method=f"derived_from({variable})",
+                original_value=originals[column].reindex(index).to_numpy(),
+                new_value=derived[column],
+                issue_id=issue_id,
+            ),
+            commit=False,
+        )
+    return written
+
+
+def _recompute_only(conn, issue_id, variable, target, parent_batch_size, dry_run) -> int:
+    """Re-derive ``rh``/``et0`` for an issue that was repaired *before* the recompute existed.
+
+    A plain re-run cannot do this. ``_fetch_targets`` scopes a ``constant_field`` incident
+    by its corrupt **value**, and after a successful repair no row carries that value any
+    more — so the ladder finds nothing, the batch loop never runs, and the derived columns
+    stay wrong. The record of what was repaired lives in ``wth_imputation_log``, so the
+    parent list comes from there: exact, small, and indexed, where a
+    ``date``-only predicate over ``wth_base`` would scan all 1,659 partitions.
+    """
+    import logging
+
+    log = logging.getLogger(__name__)
+
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT DISTINCT parent_id FROM wth_imputation_log "
+            "WHERE issue_id = %s AND variable = %s",
+            (issue_id, variable),
+        )
+        parents = sorted(p.strip() for (p,) in cur.fetchall())
+
+    if not parents:
+        log.warning("issue %s: nothing logged for %s — nothing to recompute", issue_id, variable)
+        return 0
+    if variable not in DERIVED_INPUTS:
+        log.info("issue %s: %s feeds neither rh nor et0", issue_id, variable)
+        return 0
+    if dry_run:
+        log.info(
+            "DRY RUN: would recompute rh/et0 on %s over %d parents", target, len(parents)
+        )
+        return 0
+
+    rederived = 0
+    for start in range(0, len(parents), parent_batch_size):
+        batch = parents[start : start + parent_batch_size]
+        try:
+            rederived += _recompute_derived(conn, batch, target, variable, issue_id)
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            log.error("batch %s..%s failed; rolled back", batch[0], batch[-1])
+            raise
+    return rederived
+
+
+def _logged_total(conn, issue_id: int) -> int:
+    """Cell-days recorded against one issue, across every run of this DAG.
+
+    The per-run counters describe one trigger; an issue repaired in several passes (a
+    9,842-cell incident, an interrupted run) needs the cumulative figure or its registry
+    resolution understates what was actually done.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT count(*) FROM wth_imputation_log WHERE issue_id = %s", (issue_id,)
+        )
+        return int(cur.fetchone()[0])
+
+
 def _reinstate_quarantined(conn, parents, target, variable, values, issue_id, method) -> int:
     """Move this date's quarantined cell-days back into ``wth_base`` with the repaired value.
 
@@ -394,8 +560,7 @@ def _reinstate_quarantined(conn, parents, target, variable, values, issue_id, me
 
     from src.db import silver_load
 
-    columns = ["parent_id", "child_id", "date", "tmax", "tmin", "precip",
-               "srad", "wind", "tdew", "rh", "et0"]
+    columns = WIDE_COLUMNS
     with conn.cursor() as cur:
         cur.execute(
             f"SELECT {', '.join(columns)} FROM wth_qa_failures "
@@ -461,6 +626,10 @@ with DAG(
         "method": "auto",        # auto walks that variable's ladder (repair.LADDER)
         "seed": 0,               # analog-day draw; same seed reproduces the same donor
         "dry_run": True,         # default: print the diff, write nothing
+        # Skip the ladder and only re-derive rh/et0 for cell-days already repaired. For
+        # issues repaired before the recompute existed: a normal re-run finds no targets,
+        # because the corrupt value it scopes on is exactly what the repair removed.
+        "recompute_only": False,
         # Higher than transform_silver's 8: a repair batch holds one variable over a
         # ~11-day window, not seven variables over a year, so the memory lever can be
         # slacker and fewer round trips is the thing that matters here.

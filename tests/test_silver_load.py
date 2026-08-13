@@ -16,12 +16,12 @@ from src.db import silver_load
 
 
 class FakeCursor:
-    # rowcount is what update_column reports back; psycopg2 sets it after execute().
-    rowcount = 1
-
-    def __init__(self, log, rows=None):
+    def __init__(self, log, rows=None, rowcount=1):
         self.log = log
         self._rows = rows or []
+        # What update_column and record_failures report back; psycopg2 sets it after
+        # execute(). Overridable so a test can say "no rows matched".
+        self.rowcount = rowcount
 
     def __enter__(self):
         return self
@@ -40,13 +40,14 @@ class FakeCursor:
 
 
 class FakeConn:
-    def __init__(self, rows=None):
+    def __init__(self, rows=None, rowcount=1):
         self.log = []
         self.commits = 0
         self._rows = rows
+        self._rowcount = rowcount
 
     def cursor(self):
-        return FakeCursor(self.log, self._rows)
+        return FakeCursor(self.log, self._rows, self._rowcount)
 
     def commit(self):
         self.commits += 1
@@ -113,6 +114,37 @@ def test_upsert_uses_copy_then_on_conflict():
     assert conn.commits == 1
 
 
+def test_upsert_never_overwrites_a_repaired_column():
+    """Bronze stays corrupt after a repair, so a re-transform must not put it back.
+
+    Without the bit guard, re-running transform_silver over 1987 would restore the −5.49 °C
+    tmin and clear the flag, silently, while wth_imputation_log went on claiming the repair.
+    """
+    conn = FakeConn()
+    silver_load.upsert_wide(conn, _wide())
+
+    insert = next(s for s in conn.statements if s.startswith("INSERT INTO wth_base"))
+    assert "INSERT INTO wth_base AS t" in insert
+    for column, bit in silver_load.IMPUTED_BITS.items():
+        assert (
+            f"{column} = CASE WHEN t.imputed & {bit} > 0 "
+            f"THEN t.{column} ELSE EXCLUDED.{column} END"
+        ) in insert
+        assert f"{column} = EXCLUDED.{column}," not in insert
+
+
+def test_upsert_ors_the_imputed_mask_rather_than_assigning_it():
+    # A transform supplies imputed = 0 for every row; assigning it would wipe the flags of
+    # a repair that touched a different variable in the same cell-day.
+    conn = FakeConn()
+    silver_load.upsert_wide(conn, _wide())
+
+    insert = next(s for s in conn.statements if s.startswith("INSERT INTO wth_base"))
+    assert "imputed = t.imputed | EXCLUDED.imputed" in insert
+    # is_preliminary describes the source, not the repair, so it still assigns outright.
+    assert "is_preliminary = EXCLUDED.is_preliminary" in insert
+
+
 def test_copy_payload_writes_nan_as_null():
     conn = FakeConn()
     silver_load.upsert_wide(conn, _wide(et0=np.nan, rh=np.nan))
@@ -131,7 +163,8 @@ def test_upsert_empty_frame_is_a_noop():
 
 
 def test_record_failures_clears_the_year_first():
-    conn = FakeConn()
+    # rowcount=0: nothing on this cell-day was repaired, so the failure is a real one.
+    conn = FakeConn(rowcount=0)
     failures = _wide().drop(columns=["is_preliminary"]).assign(reason="precip<0")
 
     assert silver_load.record_failures(conn, failures, ["0XKE"], 2020) == 1
@@ -140,6 +173,23 @@ def test_record_failures_clears_the_year_first():
     assert delete.startswith("DELETE FROM wth_qa_failures")
     assert conn.log[0][1] == (["0XKE"], date(2020, 1, 1), date(2020, 12, 31))
     assert any(s.startswith("COPY wth_qa_failures") for s in conn.statements)
+
+
+def test_record_failures_drops_cell_days_already_repaired():
+    """Bronze stays corrupt after a repair, so a re-transform recomputes the same failing
+    values — but the rows it would quarantine are in wth_base, repaired and protected. A
+    quarantine entry pointing at a row that is present contradicts itself."""
+    conn = FakeConn()
+    failures = _wide().assign(reason="et0<0")
+    recorded = silver_load.record_failures(conn, failures, ["0Y4H"], 1987)
+
+    purge = next(s for s in conn.statements if s.startswith("DELETE FROM wth_qa_failures f"))
+    assert "USING wth_base b" in purge
+    assert "b.imputed > 0" in purge
+    # bpchar[] keeps the join partition-prunable on the wth_base side.
+    assert "b.parent_id = ANY(%s::bpchar[])" in purge
+    # FakeCursor.rowcount is 1, so the one failure is reported as purged, not quarantined.
+    assert recorded == 0
 
 
 def test_record_failures_still_clears_when_nothing_failed():
@@ -195,8 +245,10 @@ def test_upsert_carries_an_explicit_imputed_bitmask():
     payload = next(body for sql, body in conn.log if sql.startswith("COPY _wth_staging"))
     assert payload.strip().endswith(",2")
 
+    # OR-ed, not assigned: a reinstated row carrying one bit must not clear another
+    # variable's flag on the same cell-day.
     insert = next(sql for sql, _ in conn.log if sql.startswith("INSERT INTO wth_base"))
-    assert "imputed = EXCLUDED.imputed" in insert
+    assert "imputed = t.imputed | EXCLUDED.imputed" in insert
 
 
 def test_imputed_bits_match_the_wth_base_column_order():
