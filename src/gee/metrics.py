@@ -182,6 +182,7 @@ class RunMetrics:
     _status: dict | None = field(default=None, repr=False)
 
     n_blobs: int | None = None
+    blobs_deleted: int | None = None
     bytes_remote: int | None = None
     bytes_local: int | None = None
     bytes_per_blob_max: int | None = None
@@ -243,6 +244,10 @@ class RunMetrics:
         self.bytes_local = blobs.bytes_local
         self.bytes_per_blob_max = blobs.bytes_per_blob_max
         self.t_download_s = seconds
+
+    def note_blobs_deleted(self, n: int) -> None:
+        """GCS shards cleaned up after a successful encode (best-effort; may be 0)."""
+        self.blobs_deleted = int(n)
 
     def note_raster_chunk(self, n_pixels: int) -> None:
         """Total pixels in one band-window **before** the ocean drop.
@@ -356,6 +361,7 @@ class RunMetrics:
             "eecu_hours": eecu_h,
             # B_s
             "n_blobs": self.n_blobs,
+            "blobs_deleted": self.blobs_deleted,
             "bytes_remote": remote,
             "bytes_local": self.bytes_local,
             "bytes_per_blob_max": self.bytes_per_blob_max,
