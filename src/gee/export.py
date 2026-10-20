@@ -14,6 +14,8 @@ The compute lives server-side; this module triggers it and retrieves the result:
 
 from __future__ import annotations
 
+import re
+
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -219,6 +221,47 @@ class BlobStats:
     bytes_per_blob_max: int
 
 
+# Shard names Earth Engine actually writes for a given ``name_prefix``: either the bare
+# ``<prefix>.tif`` (single image) or ``<prefix>-<offset>-<offset>.tif`` (tiled). Anything
+# else that merely *starts* with the prefix belongs to a DIFFERENT export — see
+# :func:`own_shards`.
+_SHARD_TAIL = re.compile(r"^(?:-\d+-\d+)?\.tif$")
+
+
+def export_scope(extent, *, land_only: bool, chunk_id: str | None) -> str:
+    """Short, deterministic id for *what* an export covers, used as a GCS path segment.
+
+    The shard-tail guard stops a chunked shard leaking into an unchunked prefix, but two
+    runs that are both unchunked over **different extents** still share the prefix
+    ``bronze-gee/<var>_<year>`` and would still collide. Keying the path on the request
+    makes a var-year's blobs unique per region.
+
+    Deterministic rather than random on purpose: a retry of the same request resolves to the
+    same GCS location, so an interrupted export can be resumed or overwritten in place
+    instead of orphaning a fresh copy on every attempt.
+    """
+    import hashlib
+
+    key = f"{[float(v) for v in extent]}|{bool(land_only)}|{chunk_id or ''}"
+    return hashlib.sha256(key.encode()).hexdigest()[:10]
+
+
+def own_shards(blobs, name_prefix: str):
+    """The blobs under ``name_prefix`` that this export actually wrote.
+
+    ``list_blobs(prefix=...)`` is a **string** prefix match, not a path match, so an
+    unchunked export's prefix (``bronze-gee/<scope>/tmin_2020``) also matches every chunked
+    shard of the same variable-year (``..._2020__<chunk_id>-0-0.tif``). Nothing deletes
+    blobs after a run, so those shards accumulate in the bucket indefinitely and silently
+    join a later download: measured 2026-09-24, one unchunked var-year pulled 26 foreign
+    shards and 17.8M duplicate rows spanning lat -69.75..30, far outside its own extent.
+
+    Matching the tail EE is known to append is what makes the prefix a boundary rather than
+    a substring.
+    """
+    return [b for b in blobs if _SHARD_TAIL.match(b.name[len(name_prefix):])]
+
+
 def download_prefix_measured(
     bucket: str, name_prefix: str, dest_dir: str | Path
 ) -> tuple[list[Path], BlobStats]:
@@ -233,11 +276,10 @@ def download_prefix_measured(
     dest_dir = Path(dest_dir)
     dest_dir.mkdir(parents=True, exist_ok=True)
     client = storage.Client()
-    blobs = [
-        b
-        for b in client.list_blobs(bucket, prefix=name_prefix)
-        if b.name.endswith(".tif")
-    ]
+    blobs = own_shards(
+        [b for b in client.list_blobs(bucket, prefix=name_prefix) if b.name.endswith(".tif")],
+        name_prefix,
+    )
     if not blobs:
         raise FileNotFoundError(
             f"no .tif under gs://{bucket}/{name_prefix} after a completed export"
@@ -265,6 +307,40 @@ def download_prefix(bucket: str, name_prefix: str, dest_dir: str | Path) -> list
     ``...-NNNNNNNNNN-NNNNNNNNNN.tif`` shards, all returned.
     """
     return download_prefix_measured(bucket, name_prefix, dest_dir)[0]
+
+
+def delete_prefix(bucket: str, name_prefix: str) -> int:
+    """Remove this export's own shards from GCS once they are safely encoded to Parquet.
+
+    GCS is scratch here: the Parquet under ``bronze/`` is the artifact, and a shard left
+    behind is both storage cost and a future contaminant of any export whose prefix it
+    happens to match. Deletes only what :func:`own_shards` claims, so a concurrent export's
+    shards are never touched.
+
+    Best-effort by design — the data is already on disk by the time this runs, so a failed
+    delete must not fail the download. Returns the number of blobs removed.
+    """
+    # Every step is best-effort, the client construction included: the Parquet is already on
+    # disk when this runs, so a missing credential or a revoked delete permission must cost
+    # nothing more than an uncollected blob.
+    removed = 0
+    try:
+        from google.cloud import storage
+
+        client = storage.Client()
+        blobs = own_shards(
+            [b for b in client.list_blobs(bucket, prefix=name_prefix) if b.name.endswith(".tif")],
+            name_prefix,
+        )
+        for blob in blobs:
+            try:
+                blob.delete()
+                removed += 1
+            except Exception:  # noqa: BLE001 - one stuck blob must not strand the rest
+                pass
+    except Exception:  # noqa: BLE001 - scratch cleanup must never break the pipeline
+        return removed
+    return removed
 
 
 def _band_dates(descriptions) -> list[str]:

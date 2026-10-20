@@ -30,7 +30,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from src.gee.daily import build_daily_collection
-from src.gee.export import iter_geotiff_chunks, tz_zones
+from src.gee.export import delete_prefix, export_scope, iter_geotiff_chunks, tz_zones
 from src.gee.metrics import RunMetrics, append_record, metrics_path, run_export
 from src.gee.variables import COLLECTION
 from src.grid.encode_long import DEFAULT_BLOCK_SIZE_B, encode_grid
@@ -104,7 +104,10 @@ def download_variable_year(
         return out_path
 
     bucket = client.require_bucket()
-    name_prefix = f"{client.gcs_prefix}/{variable}_{year}{suffix}"
+    # Scope the GCS path by the request itself: blobs are never cleaned up by EE, and a bare
+    # `<prefix>/<var>_<year>` is shared by every extent that ever exported that var-year.
+    scope = export_scope(extent, land_only=land_only, chunk_id=chunk_id)
+    name_prefix = f"{client.gcs_prefix}/{scope}/{variable}_{year}{suffix}"
     m = RunMetrics(
         kind="bronze_var_year",
         dataset=COLLECTION,
@@ -170,6 +173,9 @@ def download_variable_year(
                 f"{name_prefix}: export produced no land cells — check extent/land_only"
             )
         os.replace(tmp_path, out_path)
+        # Parquet is the artifact; the GCS shards are scratch. Drop them now that they are
+        # encoded, so they cannot inflate storage or contaminate a later export.
+        m.note_blobs_deleted(delete_prefix(bucket, name_prefix))
         m.note_encode_done(seconds=time.monotonic() - t_encode, parquet_path=out_path)
         if chunk_id:
             manifest.mark_spatial_chunk_done(variable, year, chunk_id)

@@ -28,7 +28,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from src.gee.chirps import build_daily_collection, covers_extent, source_spec
-from src.gee.export import FINE_CRS_TRANSFORM, iter_geotiff_chunks
+from src.gee.export import FINE_CRS_TRANSFORM, export_scope, iter_geotiff_chunks
 from src.gee.metrics import RunMetrics, append_record, metrics_path, run_export
 from src.grid.encode_fine import encode_fine_grid
 from src.grid.fine_spec import BLOCK_B
@@ -87,7 +87,10 @@ def download_source_year(
         return out_path
 
     bucket = client.require_bucket()
-    name_prefix = f"{client.gcs_prefix}/{source}_{year}"
+    # Same GCS scoping as the ERA5 path: a bare `<prefix>/<source>_<year>` is shared by
+    # every extent that ever exported it, and nothing cleans blobs up.
+    scope = export_scope(extent, land_only=False, chunk_id=None)
+    name_prefix = f"{client.gcs_prefix}/{scope}/{source}_{year}"
     m = RunMetrics(
         kind="bronze_var_year",
         dataset=spec.collection,
