@@ -23,6 +23,16 @@ pool, which caps simultaneous EECU/export tasks (stay under the noncommercial mo
 quota). Per-chunk mapping is deliberate: it is what gives per-chunk retry and lets the pool
 hold four *independent* exports, worth a net 2.64× over serial. Create the pool once:
 ``airflow pools set gee_pool 4 "GEE export cap"``.
+
+**Small extents pack the variables.** An export costs about the same whatever its area —
+it is the year of hourly ERA5 that is read — and each one also waits in EE's queue. For an
+unchunked extent whose ``land_cells × zones × variables`` fits the same measured ceiling
+(the band-count generalisation noted in ``src/gee/chunks.py``), ``pack_variables`` maps one
+task per **group of up to 3 variables per year** (3 exports a year instead of 7). The cap
+is EE's per-task work limit, measured: 3 x 365 days ran first try, 4 and 7 were restarted.
+A group EE restarts anyway is split in half and retried inside the same task. Bronze files and the manifest
+are exactly what the per-variable path writes. A farm or a province packs; a country with
+tens of thousands of cells falls back to per-variable tasks on its own.
 """
 
 from __future__ import annotations
@@ -74,6 +84,14 @@ def _plan(**context) -> list[dict]:
         "max_attempts": max_attempts,
     }
 
+    groups = _pack_plan(params, extent, variables) if chunk_parents <= 0 else None
+    if groups:
+        return [
+            {"variables": group, "year": year, "extent": extent, **common}
+            for year in years
+            for group in groups
+        ]
+
     if chunk_parents <= 0:
         spatial = [{"extent": extent}]
     else:
@@ -99,6 +117,33 @@ def _plan(**context) -> list[dict]:
             f"quota gets spread across months (docs/runbook.md, chunked backfill)."
         )
     return tasks
+
+
+def _pack_plan(params: dict, extent: list[float], variables: list[str]) -> list[list[str]]:
+    """Variable groups to export together per year, or ``[]`` for per-variable tasks.
+
+    Two limits, both measured: EE's per-task work (``PACK_MAX_VARIABLES`` per export) and
+    the cell ceiling, which a packed export spends ``len(group)`` times faster.
+    """
+    import logging
+
+    from src.db.grid_query import land_parents_in_bbox
+    from src.gee.chunks import CELL_ZONE_CEILING, fits_packed, pack_groups
+
+    if not params.get("pack_variables", True) or len(variables) < 2:
+        return []
+    groups = pack_groups(variables, int(params.get("pack_max_variables") or 3))
+    widest = max(len(g) for g in groups)
+    stats = land_parents_in_bbox(extent)
+    cells = sum(c for c, _ in stats.values())
+    zones = len(frozenset().union(*(z for _, z in stats.values()))) if stats else 0
+    pack = widest > 1 and fits_packed(cells, zones, widest)
+    logging.getLogger(__name__).info(
+        "pack_variables: %s land cells x %s zones x %s variables = %s vs ceiling %s -> %s",
+        cells, zones, widest, cells * max(zones, 1) * widest, CELL_ZONE_CEILING,
+        f"{len(groups)} export(s) per year {groups}" if pack else "one export per variable-year",
+    )
+    return groups if pack else []
 
 
 def _spatial_plan(
@@ -161,7 +206,6 @@ def _rebuild_chunk(extent: list, chunk_id: str, chunk_parents: int):
 
 
 def _download(
-    variable: str,
     year: int,
     extent: list,
     chunk_days: int,
@@ -172,19 +216,24 @@ def _download(
     chunk_parents: int = 0,
     land_parents: int | None = None,
     max_attempts: int | None = None,
+    variable: str | None = None,
+    variables: list | None = None,
 ) -> dict:
+    """One mapped task: a ``variable``-year (or chunk of one), or — packed — a whole year of
+    ``variables`` from one export (see ``_should_pack``)."""
     # No timezone param: the per-cell local-day offset comes from the tz-polygon asset,
     # derived per UTC offset present in the extent (src/gee/export.tz_zones). §5.3.
     import logging
 
     from src.config import load_config, resolve_bronze_dir
     from src.gee.client import GEEClient
-    from src.gee.download import download_variable_year
+    from src.gee.download import download_variable_year, download_year_packed_adaptive
 
     # Manifest is shared with the CDS backend: a (variable, year) done by either is done.
     from src.cds.manifest import Manifest
 
     log = logging.getLogger(__name__)
+    label = "+".join(variables) if variables else variable
 
     tz_asset = load_config().gee.tz_asset
     if not tz_asset:
@@ -202,7 +251,7 @@ def _download(
         if key == seen.get("last"):
             return
         seen["last"] = key
-        log.info("%s %s chunk %s: export state=%s attempt=%s", variable, year,
+        log.info("%s %s chunk %s: export state=%s attempt=%s", label, year,
                  chunk_id or "-", key[0], key[1])
 
     chunk = _rebuild_chunk(extent, chunk_id, chunk_parents) if chunk_id else None
@@ -210,23 +259,42 @@ def _download(
     manifest = Manifest.for_bronze_dir(bronze_dir)
     rec: dict = {}
     try:
-        path = download_variable_year(
-            GEEClient(),
-            variable,
-            year,
-            extent,
-            tz_asset=tz_asset,
-            manifest=manifest,
-            bronze_dir=bronze_dir,
-            chunk_days=int(chunk_days),
-            land_only=bool(land_only),
-            sample=sample,
-            metrics_out=rec,
-            chunk=chunk,
-            land_parents=land_parents,
-            max_attempts=max_attempts,
-            on_poll=_log_poll,
-        )
+        if variables:
+            paths = download_year_packed_adaptive(
+                GEEClient(),
+                list(variables),
+                year,
+                extent,
+                log=log.warning,
+                tz_asset=tz_asset,
+                manifest=manifest,
+                bronze_dir=bronze_dir,
+                chunk_days=int(chunk_days),
+                land_only=bool(land_only),
+                sample=sample,
+                metrics_out=rec,
+                max_attempts=max_attempts,
+                on_poll=_log_poll,
+            )
+            path = ";".join(str(p) for p in paths)
+        else:
+            path = download_variable_year(
+                GEEClient(),
+                variable,
+                year,
+                extent,
+                tz_asset=tz_asset,
+                manifest=manifest,
+                bronze_dir=bronze_dir,
+                chunk_days=int(chunk_days),
+                land_only=bool(land_only),
+                sample=sample,
+                metrics_out=rec,
+                chunk=chunk,
+                land_parents=land_parents,
+                max_attempts=max_attempts,
+                on_poll=_log_poll,
+            )
     except Exception:
         # A chunk that burned through the attempt cap is the signal that this extent's
         # zone count has outgrown the chosen chunk size — it must not be lost in a stack
@@ -236,7 +304,7 @@ def _download(
                 "%s %s chunk %s ABORTED at attempt %s (cap %s), %s zones: EE kept "
                 "restarting this export. Drop chunk_parents for this extent — do not "
                 "raise max_attempts.",
-                variable, year, chunk_id, rec.get("attempts"), max_attempts,
+                label, year, chunk_id, rec.get("attempts"), max_attempts,
                 rec.get("n_zones"),
             )
         raise
@@ -247,7 +315,7 @@ def _download(
     log.info(
         "%s %s chunk %s: %s rows, %s cells x %s days, %s zones, attempt %s, %s EECU-h, "
         "%s bytes in %s blob(s), export %ss / download %ss / encode %ss",
-        variable, year, chunk_id or "-",
+        label, year, chunk_id or "-",
         rec.get("bronze_rows"), rec.get("cells"), rec.get("days"), rec.get("n_zones"),
         rec.get("attempts"),
         rec.get("eecu_hours"), rec.get("bytes_remote"), rec.get("n_blobs"),
@@ -256,7 +324,7 @@ def _download(
     if rec.get("record_write_error"):
         log.warning("cost record not persisted: %s", rec["record_write_error"])
     return {
-        "variable": variable,
+        "variable": label,
         "year": year,
         "chunk_id": chunk_id,
         "path": str(path),
@@ -354,6 +422,13 @@ with DAG(
                                # out a third only spends more quota on the same failure.
         "skip_over_ceiling": True,  # fail the plan rather than submit an export the grid
                                     # already predicts EE will restart
+        "pack_variables": True,  # unchunked + small enough: one export per group of
+                                 # variables per year (7 vars -> 2 exports, not 7). Auto-falls
+                                 # back to per-variable when the grid says it would not fit.
+        "pack_max_variables": 3,  # variables per packed export. Measured: 3 x 365 days ran,
+                                  # 4 and 7 were restarted by EE. A restarted group is split
+                                  # in half automatically, so a too-high value costs time,
+                                  # not a failed task.
         "data_root": "",    # per-run data root override; blank = env DATA_DIR. Give each
                             # region its own root to avoid manifest clashes. A bare folder
                             # name is enough: "hn" means $DATA_DIR/hn.

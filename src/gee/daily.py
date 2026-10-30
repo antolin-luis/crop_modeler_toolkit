@@ -111,3 +111,33 @@ def build_daily_collection(
 
     days = ee.List.sequence(0, n_days - 1)
     return ee.ImageCollection(days.map(_daily))
+
+
+def build_packed_collection(
+    variables: list[str], year: int, *, zones: list[tuple[float, "ee.Geometry | None"]]
+) -> "ee.ImageCollection":
+    """Every variable's daily images for one year, in **one** collection — one export.
+
+    For a small extent the export cost is the hourly read, not the area, and each export
+    also pays a queue wait; packing the year's variables into one task removes six of the
+    seven. Each image's ``date`` property becomes ``<var>_<YYYY-MM-DD>``, so the exported
+    band reads e.g. ``1_0_tmax_2020-01-01`` and ``export.band_labels`` splits it back.
+
+    Cast to double: a GeoTIFF needs one data type across bands, and the per-variable
+    exports' values (read back as float64) are unchanged by it.
+    """
+    if not variables:
+        raise ValueError("variables must be non-empty")
+
+    def _labelled(variable):
+        def _one(img):
+            img = ee.Image(img)
+            label = ee.String(f"{variable}_").cat(ee.String(img.get("date")))
+            return ee.Image(img.toDouble().copyProperties(img)).set("date", label)
+
+        return build_daily_collection(variable, year, zones=zones).map(_one)
+
+    packed = _labelled(variables[0])
+    for variable in variables[1:]:
+        packed = packed.merge(_labelled(variable))
+    return packed

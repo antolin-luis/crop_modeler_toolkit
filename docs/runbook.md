@@ -319,6 +319,38 @@ docker compose run --rm airflow-scheduler airflow pools set gee_pool 4 "GEE expo
 
 Or Admin → Pools in the UI.
 
+### 3.2 Small extents: packed exports (automatic)
+
+An export costs about the same whatever its area, because the expensive part is reading a
+year of hourly ERA5. The measured median is 110 EECU-s per export at 4 cells, and 113 at
+9,968 cells. Each export also waits in EE's queue (median 71–181 s). For a farm-sized
+extent, one task per `(variable, year)` therefore spends most of its time on overhead:
+1950–2026 is 539 exports, about 8 hours even for 4 cells.
+
+With `chunk_parents: 0` and `pack_variables: true` (the default), the plan packs up to
+`pack_max_variables` (default 3) variables into one export per year: 7 variables become 3
+exports, so 231 for 1950–2026. Packing only applies when
+`land_cells × zones × group_size <= 58,554`, the measured cell ceiling with the band count
+scaled up. A large country falls back to one task per variable automatically. The plan
+log prints the decision:
+
+```
+pack_variables: 4 land cells x 1 zones x 3 variables = 12 vs ceiling 58554 -> 3 export(s) per year [['tmax', 'tmin', 'precip'], ['srad', 'wind_u'], ['wind_v', 'tdew']]
+```
+
+The bronze files and manifest marks are exactly what the per-variable path writes, so
+`transform_silver` needs no change. A packed export also costs less EECU than the same
+variables exported separately. Measured on 2025: 0.050 EECU-h for 3 variables, against
+~0.09 exported separately.
+
+**Why the cap is 3.** EE limits how much work one task can do. On 2025 (4 cells), 3
+variables × 365 days ran on the first attempt, while 4 and 7 were restarted about 13
+minutes into each attempt until aborted. A group that EE keeps restarting past `max_attempts`
+(default 2, the same tolerance the per-variable path gets) is split in half inside the same
+task, down to one variable if needed. A single restart is not enough to trigger a split:
+EE occasionally restarts exports that are not too big. A cap that is too high therefore
+costs some restarts, not a failed task. Lower `pack_max_variables` rather than raising it.
+
 ---
 
 ## 4. Silver transform (Step 4)
