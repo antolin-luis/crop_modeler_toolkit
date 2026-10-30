@@ -29,8 +29,15 @@ from typing import TYPE_CHECKING
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from src.gee.daily import build_daily_collection
-from src.gee.export import delete_prefix, export_scope, iter_geotiff_chunks, tz_zones
+from src.gee.daily import build_daily_collection, build_packed_collection
+from src.gee.export import (
+    ExportRestartedError,
+    delete_prefix,
+    export_scope,
+    iter_geotiff_chunks,
+    iter_packed_geotiff_chunks,
+    tz_zones,
+)
 from src.gee.metrics import RunMetrics, append_record, metrics_path, run_export
 from src.gee.variables import COLLECTION
 from src.grid.encode_long import DEFAULT_BLOCK_SIZE_B, encode_grid
@@ -189,6 +196,164 @@ def download_variable_year(
         raise
     finally:
         _emit_metrics(m, bronze_dir, metrics_out)
+
+
+def download_year_packed(
+    client,
+    variables: list[str],
+    year: int,
+    extent: list[float],
+    *,
+    tz_asset: str,
+    manifest,
+    bronze_dir: str | Path,
+    b: int = DEFAULT_BLOCK_SIZE_B,
+    chunk_days: int = 30,
+    land_only: bool = True,
+    sample: str | None = None,
+    metrics_out: dict | None = None,
+    max_attempts: int | None = None,
+    on_poll=None,
+) -> list[Path]:
+    """All of ``variables`` for one ``year`` from a **single** export.
+
+    Same artifacts as calling ``download_variable_year`` once per variable — one
+    ``bronze/<var>/<var>_<year>.parquet`` each, each var-year marked done in the shared
+    manifest — so ``transform_silver`` cannot tell the difference. What changes is the EE
+    side: one task, one queue wait, one hourly-collection graph per variable evaluated
+    together. That is the win for a small extent, where every export costs about the same
+    regardless of area (docs/runbook.md §4c).
+
+    Only the variables not already done are exported, so a year half-finished by the
+    per-variable path is completed, not redone. Unchunked only: the packed band count
+    (variables x days) eats the export ceiling ``variables`` times faster, which is why the
+    DAG decides packing from the grid before calling this.
+    """
+    todo = [
+        v for v in variables
+        if not (
+            manifest.is_var_year_done(v, year)
+            and (Path(bronze_dir) / v / f"{v}_{year}.parquet").exists()
+        )
+    ]
+    outs = {v: Path(bronze_dir) / v / f"{v}_{year}.parquet" for v in variables}
+    if not todo:
+        return list(outs.values())
+
+    bucket = client.require_bucket()
+    scope = export_scope(extent, land_only=land_only, chunk_id=None)
+    # The variables are part of the path: groups of the same year run concurrently, and a
+    # bare `packed_<year>` let one group's download pull — and its cleanup delete — the
+    # other's shards (seen 2026-10-20: tmax+tmin+precip 1974 read srad's bands).
+    name_prefix = f"{client.gcs_prefix}/{scope}/packed_{year}__{'.'.join(todo)}"
+    m = RunMetrics(
+        kind="bronze_year_packed",
+        dataset=COLLECTION,
+        name_prefix=name_prefix,
+        extent=extent,
+        variable="+".join(todo),
+        year=year,
+        sample=sample,
+        land_only=land_only,
+        b=b,
+        chunk_days=chunk_days,
+        gee_project=getattr(client, "project", None),
+    )
+    tmp = {v: outs[v].with_name(outs[v].name + ".tmp") for v in todo}
+    writers: dict[str, pq.ParquetWriter] = {}
+    try:
+        zones = tz_zones(extent, tz_asset)
+        m.note_zones(len(zones))
+        packed = build_packed_collection(todo, year, zones=zones)
+        for v in todo:
+            outs[v].parent.mkdir(parents=True, exist_ok=True)
+
+        with tempfile.TemporaryDirectory() as td:
+            paths = run_export(
+                packed,
+                extent,
+                bucket=bucket,
+                name_prefix=name_prefix,
+                description=f"bronze_packed_{year}",
+                dest_dir=td,
+                metrics=m,
+                land_only=land_only,
+                max_attempts=max_attempts,
+                on_poll=on_poll,
+            )
+            t_encode = time.monotonic()
+            try:
+                for var, values, lat, lon, times in iter_packed_geotiff_chunks(
+                    paths, todo, chunk_days=chunk_days
+                ):
+                    m.note_raster_chunk(values.size)
+                    frame = encode_grid(values, lat, lon, times, source=name_prefix, b=b)
+                    frame = frame.dropna(subset=["value"]).reset_index(drop=True)
+                    if frame.empty:
+                        continue
+                    m.note_encode_chunk(frame)
+                    table = pa.Table.from_pandas(frame, preserve_index=False)
+                    if var not in writers:
+                        writers[var] = pq.ParquetWriter(tmp[var], table.schema)
+                    writers[var].write_table(table)
+            finally:
+                for w in writers.values():
+                    w.close()
+
+        missing = [v for v in todo if v not in writers]
+        if missing:
+            raise RuntimeError(
+                f"{name_prefix}: export produced no land cells for {missing} — check "
+                "extent/land_only"
+            )
+        # Publish every file before marking any done: a crash in between leaves files the
+        # manifest does not vouch for, which the next run simply re-exports.
+        for v in todo:
+            os.replace(tmp[v], outs[v])
+        m.note_blobs_deleted(delete_prefix(bucket, name_prefix))
+        m.note_encode_done(seconds=time.monotonic() - t_encode, parquet_path=outs[todo[0]])
+        for v in todo:
+            manifest.mark_var_year_done(v, year)
+        return list(outs.values())
+    except BaseException as exc:  # noqa: BLE001 — recorded, then re-raised untouched
+        m.note_error(exc)
+        for p in tmp.values():
+            p.unlink(missing_ok=True)
+        raise
+    finally:
+        _emit_metrics(m, bronze_dir, metrics_out)
+
+
+def download_year_packed_adaptive(
+    client, variables: list[str], year: int, extent: list[float], *, log=print, **kwargs
+) -> list[Path]:
+    """``download_year_packed``, halving the group whenever EE keeps restarting the export.
+
+    How much one EE task can hold is measured, not known: 3 variables x 365 days of a
+    4-cell extent ran first try, 4 and 7 were restarted repeatedly until aborted. Rather
+    than trust a cap, a group that exhausts ``max_attempts`` is split in two and retried,
+    down to one variable — which is the per-variable path. A wrong cap then costs some
+    restarts, never a failed task.
+
+    Not split at the *first* restart: EE also restarts the odd export that is not too big
+    (seen 2026-10-20 on 2- and 3-variable groups of sizes that had run cleanly), and
+    splitting on that discards the compute for nothing. The caller's ``max_attempts``
+    (default 2 in the DAG) is the same tolerance the per-variable path gets.
+    """
+    try:
+        return download_year_packed(client, variables, year, extent, **kwargs)
+    except ExportRestartedError:
+        if len(variables) == 1:
+            raise
+        mid = (len(variables) + 1) // 2
+        log(f"{'+'.join(variables)} {year}: EE restarted the packed export, splitting into "
+            f"{variables[:mid]} and {variables[mid:]}")
+        outs = []
+        for part in (variables[:mid], variables[mid:]):
+            outs += download_year_packed_adaptive(
+                client, part, year, extent, log=log, **kwargs
+            )
+        return outs
 
 
 def _emit_metrics(m: RunMetrics, bronze_dir: str | Path, metrics_out: dict | None) -> None:

@@ -42,6 +42,15 @@ FINE_CRS_TRANSFORM = [0.05, 0, -180.0, 0, -0.05, 60.0]
 _TERMINAL = {"COMPLETED", "FAILED", "CANCELLED", "CANCEL_REQUESTED"}
 
 
+class ExportRestartedError(RuntimeError):
+    """EE restarted an export past ``max_attempts`` — it is too big for one task.
+
+    A ``RuntimeError`` so existing callers are unaffected; its own type so a caller that
+    can make the export smaller (``download.download_year_packed_adaptive``) can catch
+    exactly this and nothing else.
+    """
+
+
 def _to_multiband(daily_col: "ee.ImageCollection") -> "ee.Image":
     """Collapse the daily collection to one multi-band image, each band named by its date."""
 
@@ -190,7 +199,7 @@ def wait_for_task(
                 task.cancel()
             except Exception:  # pragma: no cover — diagnostic path only
                 pass
-            raise RuntimeError(
+            raise ExportRestartedError(
                 f"GEE export exceeded max_attempts={max_attempts}: EE is on attempt "
                 f"{attempt} (state {state}) — the export is too big for one task"
             )
@@ -387,6 +396,60 @@ def iter_geotiff_chunks(paths: list[Path], *, chunk_days: int = 30):
                 arr = src.read(bands, masked=True).filled(np.nan).astype(np.float64)
                 times = pd.to_datetime([dates[b] for b in idx])
                 yield arr, lat, lon, times
+
+
+def band_labels(descriptions, variables: list[str]) -> list[tuple[str, str]]:
+    """``(variable, YYYY-MM-DD)`` per band of a packed export (``build_packed_collection``).
+
+    The variable is matched as a whole name directly before the date, longest first, so
+    ``wind_u`` is never read as some shorter name that happens to end the same way.
+    """
+    import re
+
+    if isinstance(descriptions, str):
+        descriptions = (descriptions,)
+    names = "|".join(re.escape(v) for v in sorted(variables, key=len, reverse=True))
+    label_re = re.compile(rf"(?:^|_)({names})_(\d{{4}}-\d{{2}}-\d{{2}})$")
+    out = []
+    for desc in descriptions:
+        m = label_re.search(str(desc))
+        if not m:
+            raise ValueError(f"band description {desc!r} names none of {variables}")
+        out.append((m.group(1), m.group(2)))
+    return out
+
+
+def iter_packed_geotiff_chunks(
+    paths: list[Path], variables: list[str], *, chunk_days: int = 30
+):
+    """``iter_geotiff_chunks`` for a packed export → ``(variable, values, lat, lon, times)``.
+
+    Windows never mix variables: each yields ``chunk_days`` bands of one variable, so the
+    caller can stream each straight into that variable's own Parquet.
+    """
+    import numpy as np
+    import pandas as pd
+    import rasterio
+
+    for p in paths:
+        with rasterio.open(p) as src:
+            labels = band_labels(src.descriptions, variables)
+            t = src.transform
+            lon = t.c + (np.arange(src.width) + 0.5) * t.a
+            lat = t.f + (np.arange(src.height) + 0.5) * t.e
+            by_var: dict[str, list[int]] = {}
+            for i, (var, _) in enumerate(labels):
+                by_var.setdefault(var, []).append(i)
+            for var, idx_all in by_var.items():
+                for i0 in range(0, len(idx_all), chunk_days):
+                    idx = idx_all[i0 : i0 + chunk_days]
+                    arr = (
+                        src.read([b + 1 for b in idx], masked=True)
+                        .filled(np.nan)
+                        .astype(np.float64)
+                    )
+                    times = pd.to_datetime([labels[b][1] for b in idx])
+                    yield var, arr, lat, lon, times
 
 
 def read_daily_geotiffs(paths: list[Path]):
