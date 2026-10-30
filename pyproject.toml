@@ -44,3 +44,5 @@ line-length = 88
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# pltdt_finder/ is a top-level folder, not an installed package.
+pythonpath = ["."]

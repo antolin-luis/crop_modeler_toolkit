@@ -131,6 +131,26 @@ def resolve_bronze_dir(data_root: str | Path | None = None) -> Path:
     return load_config().paths.bronze_dir
 
 
+def resolve_data_path(path: str | Path) -> Path:
+    """An input file under ``$DATA_DIR``, by the same anchoring rule as ``resolve_bronze_dir``.
+
+    ``"fields/weizen/x.shp"`` means ``$DATA_DIR/fields/weizen/x.shp``. Anything resolving
+    outside ``$DATA_DIR`` is refused: it is not on the bind mount, so the container cannot
+    see it, and the error should say that instead of "file not found".
+    """
+    data_dir = Path(os.path.normpath(os.environ.get("DATA_DIR", "/data")))
+    p = Path(os.path.normpath(path))
+    if not p.is_absolute():
+        p = Path(os.path.normpath(data_dir / p))
+    if not p.is_relative_to(data_dir):
+        raise ValueError(
+            f"{str(path)!r} resolves to {str(p)!r}, outside DATA_DIR ({str(data_dir)!r}) — "
+            "the Airflow containers only see DATA_DIR. Copy the file under .localdata/ "
+            "on the host and pass its path relative to it."
+        )
+    return p
+
+
 def load_config() -> Config:
     """Build a Config from the current environment."""
     return Config(

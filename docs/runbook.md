@@ -671,6 +671,77 @@ was wrong, the source was not, so `accepted_source_defect` would misfile it.
 
 ---
 
+## 4c. Field polygons: weather + Sentinel-2 NDVI per pixel
+
+For a set of farm fields (a polygon shapefile), the database holds two things: the weather of
+the ERA5 cells under the fields (ordinary silver), and an NDVI time series for every 10 m
+Sentinel-2 pixel inside them (`s2_ndvi_obs`, which has no bronze layer). The worked example
+is `Weizen_LG_E2026`: 20 winter-wheat fields, ~411 ha, near Köthen, DE.
+
+**Stage the shapefile under `.localdata/`.** The containers see only `$DATA_DIR`:
+
+```bash
+mkdir -p .localdata/fields/weizen && cp /path/to/Weizen_LG_E2026.* .localdata/fields/weizen/
+```
+
+### Weather for a small extent
+
+A field bbox usually holds no ERA5 cell **centre**, and the planner selects cells by centre.
+So widen the extent until it covers the centres of every cell the fields touch, without
+spilling into further cells. Use a dedicated `data_root`, and set `chunk_parents: 0` (one
+export per var-year; the default of 400 exports a whole 20°×20° block):
+
+```bash
+docker compose exec airflow-scheduler airflow dags trigger download_bronze_gee -c \
+  '{"extent":[51.40,11.65,51.85,12.10],"start_year":1950,"end_year":2026,
+    "chunk_parents":0,"data_root":"de_weizen"}'
+```
+
+Cost scales with years × vars, not with area. A tiny extent is about 0.03 EECU-h per
+export, so 1950–2026 is about 16 EECU-h. `transform_silver` is kicked automatically. CHIRPS
+v2 stops at 50°N; above that, use only `chirps_v3_rnl` (60S–60N).
+
+### NDVI per pixel — `s2_ndvi_fields`
+
+```bash
+docker compose exec airflow-scheduler airflow dags trigger s2_ndvi_fields -c \
+  '{"shapefile":"fields/weizen/Weizen_LG_E2026.shp","start_date":"2017-03-28"}'
+```
+
+| Param | Default | |
+|---|---|---|
+| `shapefile` | `fields/weizen/Weizen_LG_E2026.shp` | relative to `$DATA_DIR`; WGS84 lon/lat |
+| `field_set` | file stem | one shapefile = one set; reloads upsert by id |
+| `id_column` / `name_column` | `ID` / `NAME` | DBF columns |
+| `start_date` / `end_date` | `2017-03-28` / today | inclusive; L2A starts 2017-03-28 |
+| `cs_threshold` | `0.6` | Cloud Score+ `cs_cdf` floor; obs below it are not stored |
+| `force` | `false` | re-extract windows already done |
+
+- **Mapping:** one mapped `extract` task per (field, calendar year), on `ee_interactive_pool`
+  (3 slots). That pool is separate from `gee_pool`, so NDVI does not wait behind an ERA5 backfill.
+- **Cost:** each task makes one synchronous `computePixels` call (no GCS), ~15 s per field-year.
+- **Reruns:** they skip done windows. The current year's window ends on the day it ran, so a
+  rerun on a later day re-pulls it.
+- **Changed fields:** a field whose geometry changed in the shapefile loses its pixels and
+  NDVI, and is re-laid out.
+
+```sql
+-- per-field coverage
+SELECT f.src_id, f.name, count(DISTINCT p.pixel_id) px, count(o.*) obs,
+       min(o.date), max(o.date)
+FROM field_parcel f JOIN s2_pixel p USING (field_id)
+LEFT JOIN s2_ndvi_obs o USING (pixel_id)
+WHERE f.field_set = 'Weizen_LG_E2026' GROUP BY 1, 2 ORDER BY 1;
+
+-- which ERA5 cells feed each field's weather
+SELECT f.src_id, g.child_id FROM field_parcel f
+JOIN era5_land_base_grid g ON ST_Intersects(g.geom, f.geom);
+```
+
+From Python: `pltdt_finder.io.load_pixel_series(...)` / `load_field_mean_series(...)`.
+
+---
+
 ## 5. Inspect it in DBeaver
 
 ### Connect
