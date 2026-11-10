@@ -1,0 +1,2 @@
+field_set,src_id,crop,season_harvest,sow_from,sow_to,source,note
+Weizen_LG_E2026,*,WW,2026,2025-09-15,2025-10-15,client,"Client report (2026-10-20): wheat planted between 15 Sep and 15 Oct 2025. src_id * = applies to every field of the set until per-field dates arrive."

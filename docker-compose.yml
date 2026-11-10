@@ -78,6 +78,10 @@ services:
         # airflow-init actually re-runs. A stack that is already up keeps the old size
         # until then; resize it live per docs/runbook.md §3.1.
         airflow pools set gee_pool 4 "GEE export cap"
+        # Cap simultaneous synchronous computePixels calls (s2_ndvi_fields binds to this
+        # pool). Separate from gee_pool: these draw on EE's interactive quota, not the batch
+        # export queue, and must not wait behind a day-long ERA5 backfill.
+        airflow pools set ee_interactive_pool 3 "GEE computePixels cap"
         # Cap simultaneous silver year-transforms (transform_silver binds to this pool).
         # ~220 MB per task process on the Pi target; tune slots live in Admin -> Pools.
         airflow pools set silver_pool 3 "Silver transform memory cap"

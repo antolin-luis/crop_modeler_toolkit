@@ -110,6 +110,73 @@ zcat seeds/era5_land_base_grid.sql.gz | \
 Only a maintainer regenerating the seed needs the `grid_build` DAG; it requires the two
 static `.nc` inputs and is not part of normal operation.
 
+### 2.1 Soil profiles (Step 6) — optional, one-off
+
+Only if you want DSSAT soil profiles alongside the weather. `soil_profile_points` holds
+1,984,797 global 5 arc-min points, each carrying a DSSAT `ID_SOIL`, and `soil_era5_map`
+pairs every 0.25° cell with the profile nearest its centre. Independent of bronze and
+silver — it needs nothing but the grid above.
+
+The source archive must live under `$DATA_DIR/bronze/static/`; that directory is owned by
+the `airflow` uid, so copy it in through the container rather than with `cp`:
+
+```bash
+docker compose cp Point5m_SoilGrids-for-DSSAT-10km_v1.shp.zip \
+  airflow-scheduler:/data/bronze/static/
+```
+
+Then trigger `soil_grid_build` (default params, nothing to pass). Roughly 100 s end to end
+on a Pi 5. The `validate` task prints the load report; `orphan_points` must be 0.
+
+```sql
+SELECT count(*) FROM soil_profile_points;                        -- 1984797
+SELECT count(DISTINCT child_id) FROM soil_era5_map;              -- 236764
+
+-- the join it exists for: a weather cell and its DSSAT soil profile
+SELECT m.child_id, m.soil_id, g.lat, g.lon
+FROM soil_era5_map m JOIN era5_land_base_grid g USING (child_id)
+WHERE m.is_nearest AND g.is_land LIMIT 10;
+```
+
+`soil_id` is a profile ID (`ISO2` + zero-padded `CELL5M`), not a filename — it goes in a
+FILEX's `ID_SOIL`. The `.SOL` files themselves are not ingested; see
+`docs/step6_soil_intake.md`.
+
+#### Coordinates in, `soil_id` out
+
+The `soil_grid_build` DAG installs these functions itself (its `install_helpers` task), so
+after a successful run they are already there — nothing to import. If you drop or edit one,
+clear and rerun that single task, or import `src/db/soil_helpers.sql` by hand (same
+procedure as `sql/wth_helpers.sql`, §5).
+
+```sql
+SELECT * FROM soil_id_at(-34.9, -56.2);          -- UY06472845, dist_km 0
+SELECT * FROM soil_id_at(-34.95, -56.05);        -- offshore: nearest, dist_km 6.91
+SELECT * FROM soil_profile_at(-34.95, -56.05);   -- exact only: 0 rows
+
+-- weather and soil for one site in one query
+SELECT s.soil_id, g.lat, g.lon, g.elevation, g.t_zone
+FROM soil_id_at(-34.9, -56.2) s JOIN era5_land_base_grid g USING (child_id);
+```
+
+From Python or the shell:
+
+```python
+from src.db.soil_query import profile_at, profiles_at
+profile_at(-34.9, -56.2).soil_id            # 'UY06472845'
+profiles_at([(-34.9, -56.2), (-10.2, -48.3)])   # whole batch, one query
+```
+
+```bash
+docker compose exec airflow-scheduler python -m src.db.soil_query --lat -34.9 --lon -56.2
+```
+
+The lookup is a primary-key read (the 5 arc-min cell id is arithmetic from the
+coordinates), so it costs one row. The layer is land-only: a coordinate on water misses its
+cell and falls back to the nearest profile within `max_km` (default 25), reporting
+`dist_km` so you can tell an exact hit from a substitute. Pass `nearest=False` /
+`soil_profile_at` if you would rather get nothing than a neighbour.
+
 ---
 
 ## 3. Bronze download (Step 3)
@@ -252,6 +319,38 @@ docker compose run --rm airflow-scheduler airflow pools set gee_pool 4 "GEE expo
 
 Or Admin → Pools in the UI.
 
+### 3.2 Small extents: packed exports (automatic)
+
+An export costs about the same whatever its area, because the expensive part is reading a
+year of hourly ERA5. The measured median is 110 EECU-s per export at 4 cells, and 113 at
+9,968 cells. Each export also waits in EE's queue (median 71–181 s). For a farm-sized
+extent, one task per `(variable, year)` therefore spends most of its time on overhead:
+1950–2026 is 539 exports, about 8 hours even for 4 cells.
+
+With `chunk_parents: 0` and `pack_variables: true` (the default), the plan packs up to
+`pack_max_variables` (default 3) variables into one export per year: 7 variables become 3
+exports, so 231 for 1950–2026. Packing only applies when
+`land_cells × zones × group_size <= 58,554`, the measured cell ceiling with the band count
+scaled up. A large country falls back to one task per variable automatically. The plan
+log prints the decision:
+
+```
+pack_variables: 4 land cells x 1 zones x 3 variables = 12 vs ceiling 58554 -> 3 export(s) per year [['tmax', 'tmin', 'precip'], ['srad', 'wind_u'], ['wind_v', 'tdew']]
+```
+
+The bronze files and manifest marks are exactly what the per-variable path writes, so
+`transform_silver` needs no change. A packed export also costs less EECU than the same
+variables exported separately. Measured on 2025: 0.050 EECU-h for 3 variables, against
+~0.09 exported separately.
+
+**Why the cap is 3.** EE limits how much work one task can do. On 2025 (4 cells), 3
+variables × 365 days ran on the first attempt, while 4 and 7 were restarted about 13
+minutes into each attempt until aborted. A group that EE keeps restarting past `max_attempts`
+(default 2, the same tolerance the per-variable path gets) is split in half inside the same
+task, down to one variable if needed. A single restart is not enough to trigger a split:
+EE occasionally restarts exports that are not too big. A cap that is too high therefore
+costs some restarts, not a failed task. Lower `pack_max_variables` rather than raising it.
+
 ---
 
 ## 4. Silver transform (Step 4)
@@ -320,6 +419,25 @@ Re-running a year that is already loaded is **safe and expected**: the upsert re
 same `(parent_id, child_id, date)` rows and bumps `ingested_at`. There is no need to clear
 anything first.
 
+> **A repaired cell-day is also never re-quarantined.** The same re-transform recomputes
+> the failing `et0` from the same corrupt bronze, so `record_failures` would file 638
+> cell-days that are sitting in `wth_base`, repaired and untouched by that run — a
+> quarantine entry contradicting the row it points at. It purges those on the way in
+> (`wth_base.imputed > 0`); the unrepaired-source debt stays visible in `wth_data_issues`
+> as `refetch_pending`, which is where it belongs.
+>
+> **Repaired values are the one exception, and they are protected.** Bronze stays corrupt
+> after a field repair (§4b) — only silver was fixed — so a plain overwrite would put the
+> bad value back and clear the flag, silently. `upsert_wide` guards each column with its own
+> `wth_base.imputed` bit, so a re-transform of 1981/1987/1998 leaves the repaired columns
+> and their flags alone and rewrites everything else. When a clean re-fetch finally arrives,
+> clear the flag first — that is the deliberate act that lets real data land:
+>
+> ```python
+> from src.db import issues
+> issues.clear_imputed(conn, "tmin", date(1987, 1, 26), parents=[...])  # then re-transform
+> ```
+
 ### Adding a new region (e.g. Honduras) — read this first
 
 Bronze files are keyed `<variable>_<year>.parquet` with **no region in the name**, and the
@@ -375,6 +493,286 @@ SELECT t_zone, count(*) FROM era5_land_base_grid WHERE is_land GROUP BY 1 ORDER 
 > years you already downloaded is skipped as "done". `data_root` sidesteps it by giving each
 > region its own manifest file — keep using separate roots until region is baked into the
 > key itself.
+
+---
+
+## 4b. Field QA scan and repair (Step 4b)
+
+Row-level QA (`qa.CHECKS`) validates one row against physics. It cannot see a field that is
+*uniformly* wrong: on 1987-01-26 every cell in the archive carried the identical `tmin`, and
+every value was individually plausible. `qa_scan` finds that class of defect; `repair_silver`
+fixes it. Both are offline — no CDS, no GEE, no quota.
+
+**Detection is automatic, and so is the first repair.** `transform_silver` runs the scan as
+its own task (`field_qa_scan`), records findings, and then — via `collect_repairs` →
+`auto_repair` — triggers `repair_silver` for any issue still at status `detected`:
+
+```
+plan → field_qa_scan (per year) → transform (per year) → collect_repairs → auto_repair
+```
+
+The scan is first (it reads bronze); the repair is last (it rewrites `wth_base` rows that
+do not exist until the year is loaded). Two guards keep this from running away:
+
+- **Only `detected` fires.** `refetch_pending`, `imputed`, `accepted_source_defect` and
+  `false_positive` are decisions already made, so the same incident is never re-repaired —
+  otherwise every transform would re-estimate an estimate from its own output.
+- **`auto_repair: false`** turns it off entirely; **`auto_repair_dry_run: true`** fires the
+  repair DAG in dry-run mode, which logs the diff and writes nothing.
+
+> **This is a deliberate departure from D5**, which argued repair must always be a human
+> decision — silent imputation is how an upstream defect stops being visible. What keeps it
+> honest here: every filled value carries its `imputed` bit and a `wth_imputation_log` row
+> with the original, the issue lands on `refetch_pending` rather than resolved, and the
+> repair still runs as its own DAG run with its own logs. The defect stays on the books;
+> only the first response is automatic.
+
+### Step 1 — scan
+
+Also applies the new DDL (`wth_base.imputed`, `wth_data_issues`, `wth_imputation_log`) via
+`ensure_schema`, so there is no separate migration step. The `ALTER TABLE` is metadata-only
+on PG 16 — instant, even at 172M rows.
+
+```bash
+docker compose run --rm airflow-scheduler \
+  airflow dags trigger qa_scan
+```
+
+| Param | Default | Notes |
+|---|---|---|
+| `start_year` / `end_year` | 1981 / 2026 | one mapped task per **variable**, each covering the range |
+| `variables` | all 7 | from the download contract — CHIRPS under `bronze/` is out of scope |
+| `record` | `true` | `false` = log findings without touching the registry |
+
+Takes ~40 min over the full archive (973 files, two columns each). Then read the registry:
+
+```sql
+SELECT issue_id, variable, date, detector, cells, status,
+       detail->>'min' AS min_value
+FROM wth_data_issues ORDER BY variable, date;
+```
+
+Expected on the current archive — **exactly three**, no more:
+
+| variable | date | cells | value |
+|---|---|---|---|
+| `precip` | 1998-05-19 | 412 | 19.0 mm |
+| `tmin` | 1981-08-11 | 412 | −7.71 °C |
+| `tmin` | 1987-01-26 | 9,842 | −5.49 °C |
+
+A fourth `precip` row means the magnitude gate regressed; a CHIRPS row means the variable
+scoping did.
+
+> **The scan reads bronze, so it cannot see every silver defect.** 341 of silver's 10,183
+> cells have no bronze source (they predate the LatAm backfill and come from the legacy
+> archive). A defect confined to those cells — as `tmin` 1987-01-25 turned out to be — never
+> appears in a `qa_scan` result and has to be registered by hand against `wth_base`. Check
+> for that class with a query over silver, not with the scan:
+>
+> ```sql
+> SELECT date, tmin, count(*) FROM wth_base
+> WHERE date BETWEEN '1987-01-20' AND '1987-01-31'
+> GROUP BY 1,2 HAVING count(*) > 100 ORDER BY 3 DESC;
+> ```
+
+### Step 2 — dry run
+
+`dry_run` is the default, so this writes nothing. It prints the before/after diff per batch.
+
+```bash
+docker compose run --rm airflow-scheduler \
+  airflow dags trigger repair_silver -c '{"issue_id": 3}'
+```
+
+Read the `apply` task log and check the `new_value` column looks like weather — for
+1987-01-26 the flanking days sit at 21–22 °C, so anything near −5 means the repair did not
+take.
+
+| Param | Default | Notes |
+|---|---|---|
+| `issue_id` | `""` | from `wth_data_issues`; or give `variable` + `date` instead |
+| `method` | `auto` | walks that variable's ladder (`repair.LADDER`) |
+| `seed` | 0 | analog-day draw — the same seed reproduces the same donor day |
+| `dry_run` | `true` | **set `false` to actually write** |
+| `recompute_only` | `false` | skip the ladder, only re-derive `rh`/`et0` for cell-days already repaired — for issues repaired before the recompute existed. A plain re-run cannot do it: the ladder scopes a `constant_field` incident by its corrupt value, which is exactly what the repair removed, so it finds no targets. The parent list comes from `wth_imputation_log` instead |
+| `parent_batch_size` | 64 | parents per batch. Do not raise it much further — the write is a partition-pruned `UPDATE`, and a batch spanning too many parents starts to look like a table scan to the planner |
+
+### Step 3 — apply
+
+```bash
+docker compose run --rm airflow-scheduler \
+  airflow dags trigger repair_silver -c '{"issue_id": 3, "dry_run": false}'
+```
+
+Per issue this writes the repaired values **one column at a time** (never `upsert_wide`,
+which would null out the other seven variables), sets the `imputed` bit, writes a
+`wth_imputation_log` row holding the **original** value, reinstates that date's quarantined
+cell-days from `wth_qa_failures`, re-derives `rh` and `et0`, and moves the registry row to
+`refetch_pending`.
+
+**`rh` and `et0` are recomputed, not left alone.** Tetens takes `(tmax+tmin)/2`, so a
+corrupt −5.49 °C `tmin` deflates `es(tmean)` and *inflates* `rh` — some of it clipping at
+100 — and drags `et0` with it. Repairing `tmin` without re-deriving them leaves a row whose
+temperature is right and whose humidity and evaporative demand still describe the defect,
+which is the hardest kind of wrong to notice. The recompute runs in the same transaction,
+goes through `merge.add_derived` (the same code path the transform uses), sets bits 64/128,
+and logs each value as `derived_from(<variable>)`. It is skipped for `precip`, which feeds
+neither formula.
+
+**The registry lands on `refetch_pending`, not `imputed`.** Every rung implemented today is
+an estimate, and `imputed` counts as resolved — the issue would vanish from
+`issues.fetch_open()` and the owed re-fetch would survive only as a log line. Reserve
+`imputed` for a repair with nothing outstanding. Standing check for open debt:
+
+```sql
+SELECT issue_id, variable, date, status, resolution FROM wth_data_issues
+WHERE status NOT IN ('refetched','imputed','accepted_source_defect','false_positive');
+```
+
+Repeat for the second `tmin` issue. **Leave the `precip` one for last and decide it by
+inspection** — 19 mm uniform is clearly wrong, but whether the real day was wet or dry needs
+a source this project has not wired yet (CHIRPS, on the `chirps-fine-grid` branch). Mark it
+`accepted_source_defect` rather than guessing:
+
+```sql
+UPDATE wth_data_issues SET status = 'accepted_source_defect',
+       resolution = 'no independent source available; left as-is', resolved_at = now()
+WHERE issue_id = 1;
+```
+
+### Verify
+
+```sql
+-- distinct values back in the flanking-day range, not 1
+SELECT date, count(*) rows, count(DISTINCT tmin) distinct_tmin, min(tmin)
+FROM wth_base WHERE date IN ('1987-01-25','1987-01-26','1987-01-27',
+                             '1981-08-10','1981-08-11','1981-08-12')
+GROUP BY date ORDER BY date;
+
+-- 1987 back to its full calendar: 10,183 x 365 = 3,716,795
+SELECT count(*) FROM wth_base WHERE date >= '1987-01-01' AND date < '1988-01-01';
+
+-- every repair reversible: original value retained
+SELECT variable, date, method, count(*), min(original_value), min(new_value)
+FROM wth_imputation_log GROUP BY 1,2,3;
+
+-- no repaired input left with a derived column that still describes the defect:
+-- every tmin-repaired cell-day must also carry the rh (64) and et0 (128) bits
+SELECT date, count(*) FILTER (WHERE imputed & 2 > 0) tmin_repaired,
+       count(*) FILTER (WHERE imputed & 2 > 0 AND imputed & 192 <> 192) missing_derived
+FROM wth_base WHERE date IN ('1987-01-25','1987-01-26','1981-08-11')
+GROUP BY date ORDER BY date;
+```
+
+`missing_derived` must be 0 on every row.
+
+Before the repair those dates show `distinct_tmin` of 340 and 7,895 with a `min` near −5.49
+/ −7.71, and 1987 holds 3,716,075 rows (720 short). After, no cell on either date has
+`tmin < 0`.
+
+### Quarantined rows a later fix makes valid
+
+A row-level check that turns out to be too strict leaves a permanent hole: the rows sit in
+`wth_qa_failures` and never reach `wth_base`. 2010-07-18 was the case — 4 cells rejected by
+`et0<0` when FAO-56 legitimately returns a small negative ET0 under saturation (rh 100,
+srad ~0.58 MJ, wind ~7 m/s). `et0.snap_negative_et0` fixed it going forward only. Reinstate
+the old rows with the same clamp; **do not** set an `imputed` bit — the value is a physical
+zero, not an estimate, and the bit would freeze the row against any later re-transform.
+
+```sql
+BEGIN;
+INSERT INTO wth_base (parent_id, child_id, date, tmax, tmin, precip, srad, wind, tdew,
+                      rh, et0, is_preliminary, imputed)
+SELECT parent_id, child_id, date, tmax, tmin, precip, srad, wind, tdew, rh,
+       CASE WHEN et0 < 0 AND et0 >= -0.1 THEN 0 ELSE et0 END, FALSE, 0
+FROM wth_qa_failures WHERE date = DATE '2010-07-18' AND reason = 'et0<0'
+ON CONFLICT (parent_id, child_id, date) DO NOTHING;
+DELETE FROM wth_qa_failures WHERE date = DATE '2010-07-18' AND reason = 'et0<0';
+COMMIT;
+```
+
+Record it in the registry as `false_positive` with the original values in `detail` — the
+quarantine row is the only copy, and the `DELETE` is what makes it the last one. The check
+was wrong, the source was not, so `accepted_source_defect` would misfile it.
+
+> **These repairs are estimates, not fixes.** No date-scoped download exists in either
+> backend yet (the CDS splitter floors at one month, GEE exports whole years), so the true
+> first rung — re-fetch from an independent source — is not available. That is why the
+> original value is logged: when sub-year re-fetch lands with the `update` DAG (Step 5),
+> every imputation here can be replaced with real data.
+
+---
+
+## 4c. Field polygons: weather + Sentinel-2 NDVI per pixel
+
+For a set of farm fields (a polygon shapefile), the database holds two things: the weather of
+the ERA5 cells under the fields (ordinary silver), and an NDVI time series for every 10 m
+Sentinel-2 pixel inside them (`s2_ndvi_obs`, which has no bronze layer). The worked example
+is `Weizen_LG_E2026`: 20 winter-wheat fields, ~411 ha, near Köthen, DE.
+
+**Stage the shapefile under `.localdata/`.** The containers see only `$DATA_DIR`:
+
+```bash
+mkdir -p .localdata/fields/weizen && cp /path/to/Weizen_LG_E2026.* .localdata/fields/weizen/
+```
+
+### Weather for a small extent
+
+A field bbox usually holds no ERA5 cell **centre**, and the planner selects cells by centre.
+So widen the extent until it covers the centres of every cell the fields touch, without
+spilling into further cells. Use a dedicated `data_root`, and set `chunk_parents: 0` (one
+export per var-year; the default of 400 exports a whole 20°×20° block):
+
+```bash
+docker compose exec airflow-scheduler airflow dags trigger download_bronze_gee -c \
+  '{"extent":[51.40,11.65,51.85,12.10],"start_year":1950,"end_year":2026,
+    "chunk_parents":0,"data_root":"de_weizen"}'
+```
+
+Cost scales with years × vars, not with area. A tiny extent is about 0.03 EECU-h per
+export, so 1950–2026 is about 16 EECU-h. `transform_silver` is kicked automatically. CHIRPS
+v2 stops at 50°N; above that, use only `chirps_v3_rnl` (60S–60N).
+
+### NDVI per pixel — `s2_ndvi_fields`
+
+```bash
+docker compose exec airflow-scheduler airflow dags trigger s2_ndvi_fields -c \
+  '{"shapefile":"fields/weizen/Weizen_LG_E2026.shp","start_date":"2017-03-28"}'
+```
+
+| Param | Default | |
+|---|---|---|
+| `shapefile` | `fields/weizen/Weizen_LG_E2026.shp` | relative to `$DATA_DIR`; WGS84 lon/lat |
+| `field_set` | file stem | one shapefile = one set; reloads upsert by id |
+| `id_column` / `name_column` | `ID` / `NAME` | DBF columns |
+| `start_date` / `end_date` | `2017-03-28` / today | inclusive; L2A starts 2017-03-28 |
+| `cs_threshold` | `0.6` | Cloud Score+ `cs_cdf` floor; obs below it are not stored |
+| `force` | `false` | re-extract windows already done |
+
+- **Mapping:** one mapped `extract` task per (field, calendar year), on `ee_interactive_pool`
+  (3 slots). That pool is separate from `gee_pool`, so NDVI does not wait behind an ERA5 backfill.
+- **Cost:** each task makes one synchronous `computePixels` call (no GCS), ~15 s per field-year.
+- **Reruns:** they skip done windows. The current year's window ends on the day it ran, so a
+  rerun on a later day re-pulls it.
+- **Changed fields:** a field whose geometry changed in the shapefile loses its pixels and
+  NDVI, and is re-laid out.
+
+```sql
+-- per-field coverage
+SELECT f.src_id, f.name, count(DISTINCT p.pixel_id) px, count(o.*) obs,
+       min(o.date), max(o.date)
+FROM field_parcel f JOIN s2_pixel p USING (field_id)
+LEFT JOIN s2_ndvi_obs o USING (pixel_id)
+WHERE f.field_set = 'Weizen_LG_E2026' GROUP BY 1, 2 ORDER BY 1;
+
+-- which ERA5 cells feed each field's weather
+SELECT f.src_id, g.child_id FROM field_parcel f
+JOIN era5_land_base_grid g ON ST_Intersects(g.geom, f.geom);
+```
+
+From Python: `pltdt_finder.io.load_pixel_series(...)` / `load_field_mean_series(...)`.
+
+---
 
 ## 5. Inspect it in DBeaver
 

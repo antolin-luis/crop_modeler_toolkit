@@ -153,6 +153,12 @@ class RunMetrics:
     chunk_days: int | None = None
     gee_project: str | None = None
     track_cells: bool = True
+    # Which column of an encoded frame names the cell. ERA5 emits ``child_id``; the 0.05°
+    # CHIRPS path emits ``fine_id`` (5-char codes, a different code space entirely — see
+    # src/grid/fine_spec.py). Declared per run rather than sniffed from the frame: a silent
+    # fallback here would turn the next new grid's column mismatch into a wrong cell count
+    # in the cost model instead of an error.
+    cell_column: str = "child_id"
 
     # Chunking (src/gee/chunks.py). All None on a whole-extent run, which is what makes a
     # chunked JSONL comparable to the E0/E1 rows already recorded at v1.
@@ -176,6 +182,7 @@ class RunMetrics:
     _status: dict | None = field(default=None, repr=False)
 
     n_blobs: int | None = None
+    blobs_deleted: int | None = None
     bytes_remote: int | None = None
     bytes_local: int | None = None
     bytes_per_blob_max: int | None = None
@@ -238,6 +245,10 @@ class RunMetrics:
         self.bytes_per_blob_max = blobs.bytes_per_blob_max
         self.t_download_s = seconds
 
+    def note_blobs_deleted(self, n: int) -> None:
+        """GCS shards cleaned up after a successful encode (best-effort; may be 0)."""
+        self.blobs_deleted = int(n)
+
     def note_raster_chunk(self, n_pixels: int) -> None:
         """Total pixels in one band-window **before** the ocean drop.
 
@@ -253,7 +264,13 @@ class RunMetrics:
         self.bronze_rows += len(frame)
         self._days.update(frame["date"].unique().tolist())
         if self.track_cells:
-            self._cells.update(frame["child_id"].unique().tolist())
+            if self.cell_column not in frame:
+                raise KeyError(
+                    f"RunMetrics.cell_column={self.cell_column!r} is not in the encoded "
+                    f"frame (columns: {list(frame.columns)}). Set cell_column to match the "
+                    "grid this run encodes on, or track_cells=False if it encodes nothing."
+                )
+            self._cells.update(frame[self.cell_column].unique().tolist())
 
     def note_units(
         self, *, cells: int | None = None, days: int | None = None, exact: bool = True
@@ -344,6 +361,7 @@ class RunMetrics:
             "eecu_hours": eecu_h,
             # B_s
             "n_blobs": self.n_blobs,
+            "blobs_deleted": self.blobs_deleted,
             "bytes_remote": remote,
             "bytes_local": self.bytes_local,
             "bytes_per_blob_max": self.bytes_per_blob_max,
@@ -404,6 +422,7 @@ def run_export(
     dest_dir: str | Path,
     metrics: RunMetrics,
     land_only: bool = True,
+    crs_transform: list[float] | None = None,
     poll_interval: float = 20.0,
     timeout: float = 6 * 3600.0,
     max_attempts: int | None = None,
@@ -419,6 +438,10 @@ def run_export(
     the only thing ``start_export`` requires. Everything ERA5-specific
     (``daily.build_daily_collection``) sits *above* this call, which is what lets the GFS
     and CHIRPS cost probes measure themselves through exactly this code path.
+
+    ``crs_transform`` is passed straight to ``start_export``; it defaults there to the 0.25°
+    ERA5 grid. A 0.05° source such as CHIRPS must pass ``export.FINE_CRS_TRANSFORM``, or both
+    the values *and* the measured cost describe a resampled export rather than the real one.
 
     ``max_attempts`` bounds EE's internal restarts (see ``export.wait_for_task``); the
     attempt count reaches the record either way, because polls are folded into ``metrics``
@@ -443,6 +466,7 @@ def run_export(
         name_prefix=name_prefix,
         description=description,
         land_only=land_only,
+        crs_transform=crs_transform,
     )
     metrics.note_task_started(task)
     try:

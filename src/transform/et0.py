@@ -31,6 +31,14 @@ ALBEDO = 0.23                    # hypothetical grass reference crop (eq. 38)
 WIND_10M_TO_2M = 0.748           # 10 m -> 2 m log-profile factor (§12.2)
 SOIL_HEAT_FLUX_DAILY = 0.0       # G ~ 0 for a daily timestep (eq. 42)
 
+# Under saturation (rh 100) with near-zero radiation the vapour-deficit and radiation terms
+# both collapse and eq. 6 returns a slightly negative ET0. The physical answer is zero
+# evaporative demand, not a rejected row — measured extreme on this archive is −0.064 mm/day
+# (2010-07-18, 4 cells). Snap those to exactly zero, mirroring how NOISE_TOLERANCE handles
+# sub-zero accumulations in merge.py. Anything more negative than this is not a saturation
+# edge case and still fails the `et0<0` check in qa.CHECKS.
+ET0_NEGATIVE_TOLERANCE = 0.1     # mm/day
+
 
 def atm_pressure(elevation):
     """Atmospheric pressure (kPa) from elevation (m) — eq. 7."""
@@ -139,4 +147,13 @@ def et0_fao56(tmax, tmin, srad, wind10, tdew, elevation, lat_deg, doy):
         900.0 / (tmean + 273.0)
     ) * u2 * (es_mean - ea)
     denominator = delta + gamma * (1.0 + 0.34 * u2)
-    return numerator / denominator
+    return snap_negative_et0(numerator / denominator)
+
+
+def snap_negative_et0(et0):
+    """Snap sub-tolerance negative ET0 to exactly zero (see ET0_NEGATIVE_TOLERANCE).
+
+    NaN is left alone: a missing input must stay a NULL ``et0`` (§8.3), not become a zero.
+    """
+    et0 = np.asarray(et0, dtype=np.float64)
+    return np.where((et0 < 0.0) & (et0 >= -ET0_NEGATIVE_TOLERANCE), 0.0, et0)

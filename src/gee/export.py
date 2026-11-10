@@ -14,6 +14,8 @@ The compute lives server-side; this module triggers it and retrieves the result:
 
 from __future__ import annotations
 
+import re
+
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -30,7 +32,23 @@ _CRS = "EPSG:4326"
 _HALF = RESOLUTION / 2.0
 _CRS_TRANSFORM = [RESOLUTION, 0, -180.0 - _HALF, 0, -RESOLUTION, 90.0 + _HALF]
 
+# CHIRPS sits on a different grid convention: its pixel EDGES fall on multiples of 0.05°,
+# so the corner is the multiple itself with no half-pixel shift (contrast the ERA5 line
+# above, where centres are on the multiples). Exporting CHIRPS through _CRS_TRANSFORM
+# resamples every pixel onto the 0.25° grid — plausible-looking output, wrong values. See
+# src/grid/fine_spec.py, which owns these constants.
+FINE_CRS_TRANSFORM = [0.05, 0, -180.0, 0, -0.05, 60.0]
+
 _TERMINAL = {"COMPLETED", "FAILED", "CANCELLED", "CANCEL_REQUESTED"}
+
+
+class ExportRestartedError(RuntimeError):
+    """EE restarted an export past ``max_attempts`` — it is too big for one task.
+
+    A ``RuntimeError`` so existing callers are unaffected; its own type so a caller that
+    can make the export smaller (``download.download_year_packed_adaptive``) can catch
+    exactly this and nothing else.
+    """
 
 
 def _to_multiband(daily_col: "ee.ImageCollection") -> "ee.Image":
@@ -99,12 +117,18 @@ def start_export(
     name_prefix: str,
     description: str,
     land_only: bool = True,
+    crs_transform: list[float] | None = None,
 ) -> "ee.batch.Task":
     """Submit the GCS export task for one ``(variable, year)`` and return the started task.
 
     ``land_only`` (default) clips the export region to land via LSIB; ocean cells then come
     back masked (nodata) and are dropped on read. Set false to export the full rectangle
     (incl. ocean, matching the CDS bronze coverage).
+
+    ``crs_transform`` defaults to the canonical 0.25° ERA5 grid. Pass
+    :data:`FINE_CRS_TRANSFORM` for a 0.05° source such as CHIRPS — the pixel grid must match
+    the source's own, or EE resamples on the way out and the exported values are no longer
+    the product's.
     """
     image = _to_multiband(daily_col)
     region = _land_region(extent) if land_only else _region(extent)
@@ -115,7 +139,7 @@ def start_export(
         fileNamePrefix=name_prefix,
         region=region,
         crs=_CRS,
-        crsTransform=_CRS_TRANSFORM,
+        crsTransform=crs_transform if crs_transform is not None else _CRS_TRANSFORM,
         fileFormat="GeoTIFF",
         maxPixels=int(1e13),
         formatOptions={"cloudOptimized": True},
@@ -175,7 +199,7 @@ def wait_for_task(
                 task.cancel()
             except Exception:  # pragma: no cover — diagnostic path only
                 pass
-            raise RuntimeError(
+            raise ExportRestartedError(
                 f"GEE export exceeded max_attempts={max_attempts}: EE is on attempt "
                 f"{attempt} (state {state}) — the export is too big for one task"
             )
@@ -206,6 +230,47 @@ class BlobStats:
     bytes_per_blob_max: int
 
 
+# Shard names Earth Engine actually writes for a given ``name_prefix``: either the bare
+# ``<prefix>.tif`` (single image) or ``<prefix>-<offset>-<offset>.tif`` (tiled). Anything
+# else that merely *starts* with the prefix belongs to a DIFFERENT export — see
+# :func:`own_shards`.
+_SHARD_TAIL = re.compile(r"^(?:-\d+-\d+)?\.tif$")
+
+
+def export_scope(extent, *, land_only: bool, chunk_id: str | None) -> str:
+    """Short, deterministic id for *what* an export covers, used as a GCS path segment.
+
+    The shard-tail guard stops a chunked shard leaking into an unchunked prefix, but two
+    runs that are both unchunked over **different extents** still share the prefix
+    ``bronze-gee/<var>_<year>`` and would still collide. Keying the path on the request
+    makes a var-year's blobs unique per region.
+
+    Deterministic rather than random on purpose: a retry of the same request resolves to the
+    same GCS location, so an interrupted export can be resumed or overwritten in place
+    instead of orphaning a fresh copy on every attempt.
+    """
+    import hashlib
+
+    key = f"{[float(v) for v in extent]}|{bool(land_only)}|{chunk_id or ''}"
+    return hashlib.sha256(key.encode()).hexdigest()[:10]
+
+
+def own_shards(blobs, name_prefix: str):
+    """The blobs under ``name_prefix`` that this export actually wrote.
+
+    ``list_blobs(prefix=...)`` is a **string** prefix match, not a path match, so an
+    unchunked export's prefix (``bronze-gee/<scope>/tmin_2020``) also matches every chunked
+    shard of the same variable-year (``..._2020__<chunk_id>-0-0.tif``). Nothing deletes
+    blobs after a run, so those shards accumulate in the bucket indefinitely and silently
+    join a later download: measured 2026-09-24, one unchunked var-year pulled 26 foreign
+    shards and 17.8M duplicate rows spanning lat -69.75..30, far outside its own extent.
+
+    Matching the tail EE is known to append is what makes the prefix a boundary rather than
+    a substring.
+    """
+    return [b for b in blobs if _SHARD_TAIL.match(b.name[len(name_prefix):])]
+
+
 def download_prefix_measured(
     bucket: str, name_prefix: str, dest_dir: str | Path
 ) -> tuple[list[Path], BlobStats]:
@@ -220,11 +285,10 @@ def download_prefix_measured(
     dest_dir = Path(dest_dir)
     dest_dir.mkdir(parents=True, exist_ok=True)
     client = storage.Client()
-    blobs = [
-        b
-        for b in client.list_blobs(bucket, prefix=name_prefix)
-        if b.name.endswith(".tif")
-    ]
+    blobs = own_shards(
+        [b for b in client.list_blobs(bucket, prefix=name_prefix) if b.name.endswith(".tif")],
+        name_prefix,
+    )
     if not blobs:
         raise FileNotFoundError(
             f"no .tif under gs://{bucket}/{name_prefix} after a completed export"
@@ -252,6 +316,40 @@ def download_prefix(bucket: str, name_prefix: str, dest_dir: str | Path) -> list
     ``...-NNNNNNNNNN-NNNNNNNNNN.tif`` shards, all returned.
     """
     return download_prefix_measured(bucket, name_prefix, dest_dir)[0]
+
+
+def delete_prefix(bucket: str, name_prefix: str) -> int:
+    """Remove this export's own shards from GCS once they are safely encoded to Parquet.
+
+    GCS is scratch here: the Parquet under ``bronze/`` is the artifact, and a shard left
+    behind is both storage cost and a future contaminant of any export whose prefix it
+    happens to match. Deletes only what :func:`own_shards` claims, so a concurrent export's
+    shards are never touched.
+
+    Best-effort by design — the data is already on disk by the time this runs, so a failed
+    delete must not fail the download. Returns the number of blobs removed.
+    """
+    # Every step is best-effort, the client construction included: the Parquet is already on
+    # disk when this runs, so a missing credential or a revoked delete permission must cost
+    # nothing more than an uncollected blob.
+    removed = 0
+    try:
+        from google.cloud import storage
+
+        client = storage.Client()
+        blobs = own_shards(
+            [b for b in client.list_blobs(bucket, prefix=name_prefix) if b.name.endswith(".tif")],
+            name_prefix,
+        )
+        for blob in blobs:
+            try:
+                blob.delete()
+                removed += 1
+            except Exception:  # noqa: BLE001 - one stuck blob must not strand the rest
+                pass
+    except Exception:  # noqa: BLE001 - scratch cleanup must never break the pipeline
+        return removed
+    return removed
 
 
 def _band_dates(descriptions) -> list[str]:
@@ -298,6 +396,60 @@ def iter_geotiff_chunks(paths: list[Path], *, chunk_days: int = 30):
                 arr = src.read(bands, masked=True).filled(np.nan).astype(np.float64)
                 times = pd.to_datetime([dates[b] for b in idx])
                 yield arr, lat, lon, times
+
+
+def band_labels(descriptions, variables: list[str]) -> list[tuple[str, str]]:
+    """``(variable, YYYY-MM-DD)`` per band of a packed export (``build_packed_collection``).
+
+    The variable is matched as a whole name directly before the date, longest first, so
+    ``wind_u`` is never read as some shorter name that happens to end the same way.
+    """
+    import re
+
+    if isinstance(descriptions, str):
+        descriptions = (descriptions,)
+    names = "|".join(re.escape(v) for v in sorted(variables, key=len, reverse=True))
+    label_re = re.compile(rf"(?:^|_)({names})_(\d{{4}}-\d{{2}}-\d{{2}})$")
+    out = []
+    for desc in descriptions:
+        m = label_re.search(str(desc))
+        if not m:
+            raise ValueError(f"band description {desc!r} names none of {variables}")
+        out.append((m.group(1), m.group(2)))
+    return out
+
+
+def iter_packed_geotiff_chunks(
+    paths: list[Path], variables: list[str], *, chunk_days: int = 30
+):
+    """``iter_geotiff_chunks`` for a packed export → ``(variable, values, lat, lon, times)``.
+
+    Windows never mix variables: each yields ``chunk_days`` bands of one variable, so the
+    caller can stream each straight into that variable's own Parquet.
+    """
+    import numpy as np
+    import pandas as pd
+    import rasterio
+
+    for p in paths:
+        with rasterio.open(p) as src:
+            labels = band_labels(src.descriptions, variables)
+            t = src.transform
+            lon = t.c + (np.arange(src.width) + 0.5) * t.a
+            lat = t.f + (np.arange(src.height) + 0.5) * t.e
+            by_var: dict[str, list[int]] = {}
+            for i, (var, _) in enumerate(labels):
+                by_var.setdefault(var, []).append(i)
+            for var, idx_all in by_var.items():
+                for i0 in range(0, len(idx_all), chunk_days):
+                    idx = idx_all[i0 : i0 + chunk_days]
+                    arr = (
+                        src.read([b + 1 for b in idx], masked=True)
+                        .filled(np.nan)
+                        .astype(np.float64)
+                    )
+                    times = pd.to_datetime([labels[b][1] for b in idx])
+                    yield var, arr, lat, lon, times
 
 
 def read_daily_geotiffs(paths: list[Path]):

@@ -51,6 +51,47 @@ _EPS = 1e-9
 CELL_ZONE_CEILING = 58_554
 
 
+# Variables per packed export (``build_packed_collection``). Measured 2026-10-20 on a 4-cell
+# extent, full year 2025: 3 variables ran first try (216 s compute); 4 and 7 were both
+# restarted by EE ~13 min into each attempt — a per-task work limit, not a cell one. (2026
+# with all 7 did complete, but that year is only partly published.) The DAG splits any
+# group EE restarts anyway (``download.download_year_packed_adaptive``).
+PACK_MAX_VARIABLES = 3
+
+
+def pack_groups(variables: list[str], max_per_export: int = PACK_MAX_VARIABLES) -> list[list[str]]:
+    """Split ``variables`` into the fewest exports of at most ``max_per_export``, balanced.
+
+    Sizes differ by at most one (7 at a cap of 3 -> 3, 2, 2, never 3, 3, 1), so no export
+    carries more work than it has to.
+    """
+    if max_per_export < 1:
+        raise ValueError(f"max_per_export must be >= 1, got {max_per_export}")
+    n = -(-len(variables) // max_per_export)
+    if n == 0:
+        return []
+    base, extra = divmod(len(variables), n)
+    out, i = [], 0
+    for k in range(n):
+        size = base + (1 if k < extra else 0)
+        out.append(list(variables[i : i + size]))
+        i += size
+    return out
+
+
+def fits_packed(land_cells: int, zones: int, n_variables: int) -> bool:
+    """True when one export can carry ``n_variables`` of a year over this many cells.
+
+    The cell-side generalisation the note above asks for: the ceiling was measured at 366
+    bands and a packed export has ``n_variables`` times that, so the budget scales down by
+    the same factor. Only probed on a 4-cell extent so far; a packed export near this line
+    deserves its own probe before a backfill relies on it. The per-task work limit is
+    separate and handled by ``PACK_MAX_VARIABLES``.
+    """
+    load = land_cells * max(zones, 1) * n_variables
+    return 0 < load <= CELL_ZONE_CEILING
+
+
 @dataclass(frozen=True)
 class Chunk:
     """One export unit: a ``k x k`` block of parents, aligned to the canonical grid."""

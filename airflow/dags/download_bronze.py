@@ -75,7 +75,8 @@ with DAG(
         # is the path for extents spanning several timezones.
         "timezone": "UTC-03:00",
         "data_root": "",    # per-run data root override; blank = env DATA_DIR. Give each
-                            # region its own root (e.g. /data/hn) to avoid manifest clashes.
+                            # region its own root to avoid manifest clashes. A bare folder
+                            # name is enough: "hn" means $DATA_DIR/hn.
     },
 ) as dag:
     plan = PythonOperator(

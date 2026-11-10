@@ -47,15 +47,17 @@ df = fetch_series(-34.9, -56.2, "2020-01-01", "2020-12-31")   # Montevideo, dail
 ## Layout
 
 ```
-src/grid/        canonical grid spec, deterministic encoding, shared raster encoder
+src/grid/        canonical grid spec, deterministic encoding, shared raster encoder,
+                 streaming dBase III reader
 src/cds/         CDS client, adaptive cost splitter, manifest, download
 src/gee/         Earth Engine backend: daily reduce, GCS export, streamed encode
 src/transform/   wide merge, unit contract, Tetens RH, FAO-56 ET0, QA
-src/db/          grid + silver DDL, COPY/upsert loaders, seeder, read API
-airflow/dags/    grid_build, download_bronze[_gee], transform_silver, update
+src/db/          grid + silver + soil DDL, COPY/upsert loaders, seeders, read APIs
+airflow/dags/    grid_build, download_bronze[_gee], transform_silver, update,
+                 soil_grid_build
 seeds/           shipped global grid dump, restored at first container init
 docs/            runbook + one design doc per roadmap step
-tests/           129 offline tests
+tests/           463 offline tests
 ```
 
 ## Grid encoding
