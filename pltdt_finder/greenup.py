@@ -18,8 +18,12 @@ Per field and season:
 
 Seeds sit underground on a bare-looking field until emergence, so sowing can fall before L;
 only G bounds it. The lags stand in for sowing -> emergence -> first detectable leaves,
-roughly 10-25 days in a central-European autumn. They are fixed constants here; a
-growing-degree-day version from the cell's ERA5 temperature is the natural next step.
+roughly 10-25 days in a central-European autumn. Given a daily mean temperature series
+(``tmean``, e.g. the field's ERA5 cell), the lags are thermal time instead: walk back from
+G until ``gdd_min`` / ``gdd_typ`` degree-days (base 0 degC) have accumulated. A cold late
+October then yields a longer lag (earlier sowing) than a mild September. Without ``tmean``
+the fixed day lags apply. ``sowing_fixed`` always carries the fixed-lag estimate for
+comparison.
 
 Only dates with ``clear_frac >= min_clear`` are used — a median from 5 % of a field is not
 a field. A date more than ``spike`` below *both* neighbours, with those neighbours at most
@@ -51,6 +55,8 @@ class Estimate:
     window_end: pd.Timestamp | None
     sowing: pd.Timestamp | None
     confident: bool = False
+    sowing_fixed: pd.Timestamp | None = None   # G - lag_typ days, for comparison
+    lag_days: int | None = None                 # G - sowing, days
 
 
 def clear_series(series: pd.DataFrame, start: str, end: str, min_clear: float) -> pd.DataFrame:
@@ -74,6 +80,28 @@ def despike(s: pd.DataFrame, spike: float, gap_days: int) -> pd.DataFrame:
     return s[keep].reset_index(drop=True)
 
 
+def gdd_back(
+    tmean: pd.Series, end: pd.Timestamp, target: float, floor: pd.Timestamp
+) -> pd.Timestamp:
+    """Earliest day D with sum of max(0, tmean) over [D, end) >= ``target``; >= ``floor``.
+
+    ``tmean`` is daily mean temperature (degC) indexed by date. Missing days count 0, so a
+    gap in the weather lengthens the lag rather than inventing heat. Stops at ``floor``.
+    """
+    end = pd.Timestamp(end)
+    floor = pd.Timestamp(floor)
+    acc = 0.0
+    d = end
+    while d > floor:
+        d = d - dt.timedelta(days=1)
+        v = tmean.get(d)
+        if v is not None and pd.notna(v):
+            acc += max(0.0, float(v))
+        if acc >= target:
+            return d
+    return floor
+
+
 def estimate_sowing(
     series: pd.DataFrame,
     field_id: int,
@@ -90,6 +118,9 @@ def estimate_sowing(
     lag_min: int = 10,
     lag_typ: int = 25,
     earliest: str | None = None,
+    tmean: pd.Series | None = None,
+    gdd_min: float = 120.0,
+    gdd_typ: float = 250.0,
 ) -> Estimate:
     """``series``: rows of one field with ``date``, ``ndvi_median``, ``clear_frac``."""
     none = Estimate(field_id, None, None, None, None, None, None, None)
@@ -120,7 +151,13 @@ def estimate_sowing(
     removed = dates[ri] if ri is not None else pd.Timestamp(season_start)
     w0 = removed + dt.timedelta(days=1)
     g = dates[gi]
-    w1 = max(w0, g - dt.timedelta(days=lag_min))
-    sow = max(w0, g - dt.timedelta(days=lag_typ))
+    fixed = max(w0, g - dt.timedelta(days=lag_typ))
+    if tmean is None:
+        w1 = max(w0, g - dt.timedelta(days=lag_min))
+        sow = fixed
+    else:
+        w1 = gdd_back(tmean, g, gdd_min, w0)
+        sow = gdd_back(tmean, g, gdd_typ, w0)
     confident = earliest is None or sow >= pd.Timestamp(earliest)
-    return Estimate(field_id, removed, bare, dates[li], g, w0, w1, sow, confident)
+    return Estimate(field_id, removed, bare, dates[li], g, w0, w1, sow, confident,
+                    sowing_fixed=fixed, lag_days=(g - sow).days)
