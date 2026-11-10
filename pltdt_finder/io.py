@@ -91,3 +91,40 @@ def load_field_mean_series(
 ) -> pd.DataFrame:
     """One row per (field, date): median/mean NDVI over clear pixels and ``clear_frac``."""
     return _read(_FIELD_SQL, _params(field_set, field_id, start, end, cs_min), conn)
+
+
+_CROP_SQL = """
+SELECT field_id, src_id, name, (attrs->>'FLAECHE')::float AS ha,
+       (attrs->>'ERNTEJAHR')::int AS harvest,
+       attrs->>'FRUCHTART' AS c0, attrs->>'V1_FRUCHT' AS c1, attrs->>'V2_FRUCHT' AS c2
+FROM field_parcel WHERE field_set = %(field_set)s ORDER BY field_id
+"""
+
+
+def _crop(v) -> str | None:
+    v = (v or "").replace("\x00", "").strip()
+    return v or None
+
+
+def crop_history(field_set: str, conn=None) -> pd.DataFrame:
+    """One row per (field, harvest year) from the shapefile's rotation attributes.
+
+    ``FRUCHTART`` is the crop harvested in ``ERNTEJAHR``; ``V1_FRUCHT`` / ``V2_FRUCHT`` are
+    read as the crops harvested one and two years earlier (German *Vorfrucht*). Columns:
+    ``field_id, src_id, name, ha, harvest, crop`` (``crop`` None when not recorded).
+    """
+    own = conn is None
+    conn = conn or db_load.connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(_CROP_SQL, {"field_set": field_set})
+            rows = cur.fetchall()
+    finally:
+        if own:
+            conn.close()
+    out = []
+    for fid, src, name, ha, harvest, *crops in rows:
+        for back, c in enumerate(crops):
+            out.append({"field_id": fid, "src_id": src, "name": name, "ha": ha,
+                        "harvest": harvest - back, "crop": _crop(c)})
+    return pd.DataFrame(out)
